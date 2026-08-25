@@ -83,6 +83,144 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         }
     }
 
+    @MainActor
+    func testFixtureDrivenReplayPreservesOrderingDeduplicationAndFinalFlush() async throws {
+        let streamClient = ScriptedSSEStreamingClient(connectionScripts: [
+            [
+                .init(.token("Alpha "), lastEventID: "stream-123:1"),
+                .init(.token("bravo "), lastEventID: "stream-123:2"),
+                .init(.transportError("Connection lost"))
+            ],
+            [
+                .init(.token("Alpha "), lastEventID: "stream-123:1"),
+                .init(.token("bravo "), lastEventID: "stream-123:2"),
+                .init(.token("charlie."), lastEventID: "stream-123:3"),
+                .init(.done(DoneStreamEvent())),
+                .init(.streamEnd)
+            ]
+        ])
+        let viewModel = try makeStreamingViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse(#"{"session_id":"performance-session","stream_id":"stream-123"}"#, for: request)
+            case "/api/chat/stream/status":
+                return apiTestJSONResponse(#"{"active":false,"stream_id":"stream-123","replay_available":true}"#, for: request)
+            case "/api/session":
+                return apiTestJSONResponse(#"{"session":{"session_id":"performance-session"}}"#, for: request)
+            default:
+                XCTFail("Unexpected request path")
+                throw URLError(.badURL)
+            }
+        }
+
+        ChatPerformanceInstrumentation.shared.reset()
+        let didStart = await viewModel.sendMessage("Keep working")
+        XCTAssertTrue(didStart)
+        streamClient.playArmedConnectionScript()
+        try await waitUntil { streamClient.startedURLs.count == 2 }
+        streamClient.playArmedConnectionScript()
+
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working", "Alpha bravo charlie."])
+        XCTAssertEqual(Set(viewModel.messages.map(\.id)).count, viewModel.messages.count)
+        XCTAssertEqual(viewModel.activeStreamID, nil)
+        XCTAssertEqual(ChatPerformanceInstrumentation.shared.summary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 1)
+    }
+
+    @MainActor
+    func testFixtureDrivenCancellationAndErrorCloseIntervalsAfterSynchronousFlush() async throws {
+        let cancellationClient = ScriptedSSEStreamingClient(connectionScripts: [[
+            .init(.token("Partial response"))
+        ]])
+        let cancellationViewModel = try makeStreamingViewModel(streamClient: cancellationClient) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse(#"{"session_id":"performance-session","stream_id":"cancel-stream"}"#, for: request)
+            case "/api/chat/cancel":
+                return apiTestJSONResponse(#"{"ok":true,"cancelled":true}"#, for: request)
+            default:
+                throw URLError(.badURL)
+            }
+        }
+
+        ChatPerformanceInstrumentation.shared.reset()
+        let didStartCancellation = await cancellationViewModel.sendMessage("Cancel this")
+        XCTAssertTrue(didStartCancellation)
+        cancellationClient.playArmedConnectionScript()
+        _ = try await cancellationViewModel.cancelActiveStream()
+        let cancellationSummary = ChatPerformanceInstrumentation.shared.summary
+        XCTAssertEqual(cancellationSummary.counters[ChatPerformancePhase.cancellations.rawValue], 1)
+        XCTAssertEqual(cancellationSummary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 1)
+        XCTAssertEqual(cancellationViewModel.messages.compactMap(\.content), ["Cancel this", "Partial response"])
+
+        let errorClient = ScriptedSSEStreamingClient(connectionScripts: [[
+            .init(.token("Before error")),
+            .init(.error("Scripted stream error"))
+        ]])
+        let errorViewModel = try makeStreamingViewModel(streamClient: errorClient) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/start")
+            return apiTestJSONResponse(#"{"session_id":"performance-session","stream_id":"error-stream"}"#, for: request)
+        }
+
+        ChatPerformanceInstrumentation.shared.reset()
+        let didStartError = await errorViewModel.sendMessage("Handle error")
+        XCTAssertTrue(didStartError)
+        errorClient.playArmedConnectionScript()
+        let errorSummary = ChatPerformanceInstrumentation.shared.summary
+        XCTAssertEqual(errorSummary.counters[ChatPerformancePhase.errors.rawValue], 1)
+        XCTAssertGreaterThanOrEqual(errorSummary.counters[ChatPerformancePhase.finalFlushes.rawValue] ?? 0, 1)
+        XCTAssertEqual(errorSummary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 1)
+        XCTAssertEqual(errorViewModel.messages.compactMap(\.content), ["Handle error", "Before error"])
+    }
+
+    func testFixtureContentGroupingAndExpansionKeepAnchorsStable() {
+        for contentKind in [ChatPerformanceContentKind.markdown, .math, .reasoning, .tool] {
+            let fixture = ChatPerformanceFixture.make(
+                rowCount: 4,
+                responseBytes: 4_096,
+                contentKind: contentKind,
+                toolState: contentKind == .tool ? .expanded : .none
+            )
+            let transcript = ChatViewModel.transcriptMessages(from: fixture.messages)
+
+            XCTAssertEqual(transcript.map(\.anchorID), fixture.messages.filter { $0.role != "tool" }.map(\.id))
+            XCTAssertEqual(transcript.map(\.id), transcript.map(\.id).sorted())
+            XCTAssertEqual(transcript.count, contentKind == .tool ? 0 : fixture.messages.count)
+            XCTAssertTrue(fixture.messages.allSatisfy { message in
+                message.content?.isEmpty == false || message.reasoning?.isEmpty == false
+            })
+            switch contentKind {
+            case .markdown:
+                XCTAssertTrue(fixture.messages.allSatisfy { $0.content?.contains("**Stable**") == true })
+            case .math:
+                XCTAssertTrue(fixture.messages.allSatisfy { $0.content?.contains("$") == true })
+            case .reasoning:
+                XCTAssertEqual(
+                    ChatViewModel.reasoningDisplayGroups(messages: fixture.messages, archivedGroups: []).count,
+                    2
+                )
+            case .tool:
+                XCTAssertTrue(transcript.isEmpty)
+            default:
+                XCTFail("Unexpected content kind in grouping fixture")
+            }
+        }
+
+        let streaming = [
+            ChatMessage(role: "user", content: "Question", timestamp: 1, messageId: "user-1"),
+            ChatMessage(role: "assistant", content: "Partial", timestamp: 2, messageId: "stream-1")
+        ]
+        let completed = [
+            ChatMessage(role: "user", content: "Question", timestamp: 1, messageId: "user-1"),
+            ChatMessage(role: "assistant", content: "Complete", timestamp: 2, messageId: "assistant-1")
+        ]
+        let streamingTranscript = ChatViewModel.transcriptMessages(from: streaming)
+        let completedTranscript = ChatViewModel.transcriptMessages(from: completed)
+        XCTAssertEqual(streamingTranscript.map(\.id), completedTranscript.map(\.id))
+        XCTAssertEqual(streamingTranscript.first?.anchorID, "user-1")
+        XCTAssertEqual(streamingTranscript.last?.anchorID, "stream-1")
+        XCTAssertEqual(completedTranscript.last?.anchorID, "assistant-1")
+    }
+
     private static func messageJSON(index: Int) -> [String: Any] {
         [
             "role": index.isMultiple(of: 2) ? "user" : "assistant",
@@ -90,5 +228,37 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
             "_ts": Double(index),
             "message_id": "performance-message-\(index)"
         ]
+    }
+
+    @MainActor
+    private func makeStreamingViewModel(
+        streamClient: ScriptedSSEStreamingClient,
+        handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
+    ) throws -> ChatViewModel {
+        let client = makeClient(handler: handler)
+        let viewModel = ChatViewModel(
+            session: SessionSummary(sessionId: "performance-session"),
+            server: URL(string: "https://example.test")!,
+            client: client,
+            streamClient: streamClient,
+            approvalStreamClient: ScriptedSSEStreamingClient(),
+            clarifyStreamClient: ScriptedSSEStreamingClient(),
+            btwStreamClient: ScriptedSSEStreamingClient()
+        )
+        streamClient.flushPendingStreamingContent = { [weak viewModel] in
+            viewModel?.flushPendingStreamingContent()
+        }
+        return viewModel
+    }
+
+    @MainActor
+    private func waitUntil(
+        _ condition: @MainActor () -> Bool
+    ) async throws {
+        for _ in 0..<10_000 {
+            if condition() { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for scripted stream recovery")
     }
 }
