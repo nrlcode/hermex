@@ -205,6 +205,100 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
             }
         }
 
+        var transcriptIDsByToolState: [[String]] = []
+        var anchorIDsByToolState: [[String]] = []
+
+        for toolState in [ChatPerformanceToolState.collapsed, .expanded] {
+            let fixture = ChatPerformanceFixture.make(
+                rowCount: 4,
+                responseBytes: 4_096,
+                contentKind: .tool,
+                toolState: toolState
+            )
+            let messages = [
+                ChatMessage(
+                    role: "user",
+                    content: "Run the tools",
+                    timestamp: 0,
+                    messageId: "tool-user"
+                ),
+                ChatMessage(
+                    role: "assistant",
+                    content: nil,
+                    timestamp: 1,
+                    messageId: "tool-assistant",
+                    toolCalls: [
+                        .object([
+                            "id": .string("call-1"),
+                            "function": .object([
+                                "name": .string("read_file"),
+                                "arguments": .string("{\"path\":\"notes.txt\"}")
+                            ])
+                        ]),
+                        .object([
+                            "id": .string("call-2"),
+                            "function": .object([
+                                "name": .string("search_files"),
+                                "arguments": .string("{\"path\":\"Sources\"}")
+                            ])
+                        ])
+                    ]
+                ),
+                ChatMessage(
+                    role: "tool",
+                    content: fixture.messages[0].content,
+                    timestamp: 2,
+                    messageId: "tool-result-1",
+                    toolCallId: "call-1"
+                ),
+                ChatMessage(
+                    role: "tool",
+                    content: fixture.messages[1].content,
+                    timestamp: 3,
+                    messageId: "tool-result-2",
+                    toolCallId: "call-2"
+                )
+            ]
+            let groups = ToolCallGroup.groups(
+                persistedToolCalls: [],
+                messages: messages,
+                messageOffset: nil
+            )
+            let transcript = ChatViewModel.transcriptMessages(from: messages)
+            guard let group = groups.first else {
+                XCTFail("Expected one grouped tool activity")
+                continue
+            }
+
+            XCTAssertEqual(groups.count, 1)
+            XCTAssertEqual(fixture.scenario.toolState, toolState)
+            XCTAssertEqual(group.toolCalls.map(\.id), ["call-1", "call-2"])
+            XCTAssertEqual(group.toolCalls.map(\.name), ["read_file", "search_files"])
+            XCTAssertTrue(group.toolCalls.allSatisfy { toolCall in
+                (toolCall.preview ?? "").hasSuffix(" output") == (toolState == .expanded)
+            })
+            XCTAssertEqual(
+                group.toolCalls.map(\.preview),
+                [fixture.messages[0].content, fixture.messages[1].content]
+            )
+            XCTAssertEqual(group.anchorMessageID, "tool-assistant")
+            XCTAssertEqual(group.anchorMessageID, transcript.last?.anchorID)
+            XCTAssertEqual(transcript.map(\.anchorID), ["tool-user", "tool-assistant"])
+
+            transcriptIDsByToolState.append(transcript.map(\.id))
+            anchorIDsByToolState.append(transcript.map(\.anchorID))
+        }
+
+        XCTAssertEqual(transcriptIDsByToolState.count, 2)
+        XCTAssertEqual(anchorIDsByToolState.count, 2)
+        guard transcriptIDsByToolState.count == 2,
+              anchorIDsByToolState.count == 2
+        else {
+            return
+        }
+        XCTAssertEqual(transcriptIDsByToolState[0], transcriptIDsByToolState[1])
+        XCTAssertEqual(anchorIDsByToolState[0], anchorIDsByToolState[1])
+
         let streaming = [
             ChatMessage(role: "user", content: "Question", timestamp: 1, messageId: "user-1"),
             ChatMessage(role: "assistant", content: "Partial", timestamp: 2, messageId: "stream-1")
