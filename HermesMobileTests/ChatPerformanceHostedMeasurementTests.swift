@@ -4,7 +4,6 @@ import UIKit
 import XCTest
 @testable import HermesMobile
 
-@MainActor
 final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
     private var previousAnimationEnabled: Any?
     private var hostedWindow: UIWindow?
@@ -16,14 +15,17 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         )
         UserDefaults.standard.set(false, forKey: StreamedTextAnimationSettings.isEnabledKey)
         UIView.setAnimationsEnabled(false)
-        ChatPerformanceInstrumentation.shared.reset()
     }
 
     override func tearDown() {
-        hostedWindow?.rootViewController = nil
-        hostedWindow?.isHidden = true
-        hostedWindow = nil
-        ChatPerformanceInstrumentation.shared.reset()
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                hostedWindow?.rootViewController = nil
+                hostedWindow?.isHidden = true
+                hostedWindow = nil
+                ChatPerformanceInstrumentation.shared.reset()
+            }
+        }
         UIView.setAnimationsEnabled(true)
         if let previousAnimationEnabled {
             UserDefaults.standard.set(
@@ -36,6 +38,7 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         super.tearDown()
     }
 
+    @MainActor
     func testHostedTranscriptMappingCopiesLiveViewModelCountsAndFourKilobyteAssistant() async throws {
         let viewModel = try await loadPaginatedViewModel(rowCount: 50, includeFourKilobyteAssistant: true)
         let view = ChatTranscriptHostingSupport.transcriptView(from: viewModel)
@@ -47,18 +50,22 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         XCTAssertEqual(view.messages.last?.content?.utf8.count, 4096)
     }
 
+    @MainActor
     func testHostedStaticTranscriptMeasurementExportsLayoutEvidence50() async throws {
         try await measureHostedStaticTranscript(rowCount: 50)
     }
 
+    @MainActor
     func testHostedStaticTranscriptMeasurementExportsLayoutEvidence200() async throws {
         try await measureHostedStaticTranscript(rowCount: 200)
     }
 
+    @MainActor
     func testHostedStaticTranscriptMeasurementExportsLayoutEvidence500() async throws {
         try await measureHostedStaticTranscript(rowCount: 500)
     }
 
+    @MainActor
     func testHostedStreamingTranscriptMeasurementExportsLayoutEvidence() async throws {
         let fixture = ChatPerformanceFixture.make(
             rowCount: 50,
@@ -156,6 +163,7 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         )
     }
 
+    @MainActor
     private func measureHostedStaticTranscript(rowCount: Int) async throws {
         let viewModel = try await loadPaginatedViewModel(
             rowCount: rowCount,
@@ -197,6 +205,7 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         )
     }
 
+    @MainActor
     private func assertHostedSuccess(
         viewModel: ChatViewModel,
         samples: [UInt64],
@@ -237,6 +246,7 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         )
     }
 
+    @MainActor
     private func collectLayoutSample(
         window: UIWindow,
         host: UIHostingController<ChatTranscriptView>,
@@ -281,6 +291,7 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         samples.append(sample)
     }
 
+    @MainActor
     private func publishHostedEvidence(
         suite: String,
         testName: String,
@@ -320,6 +331,7 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         add(attachment)
     }
 
+    @MainActor
     private func loadPaginatedViewModel(
         rowCount: Int,
         includeFourKilobyteAssistant: Bool
@@ -374,6 +386,7 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         return apiTestJSONResponse(String(decoding: data, as: UTF8.self), for: request)
     }
 
+    @MainActor
     private func makeStreamingViewModel(
         streamClient: ScriptedSSEStreamingClient,
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)

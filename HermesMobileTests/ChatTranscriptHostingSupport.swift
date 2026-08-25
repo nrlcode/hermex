@@ -141,6 +141,10 @@ enum ChatTranscriptHostingSupport {
         host: UIHostingController<ChatTranscriptView>,
         timeout: TimeInterval
     ) -> HostedLayoutResult {
+        if timeout <= 0 {
+            return .unavailable("timeout")
+        }
+
         let startPasses = ChatPerformanceInstrumentation.shared.summary.counters[
             ChatPerformancePhase.transcriptLayoutPasses.rawValue
         ] ?? 0
@@ -174,9 +178,6 @@ enum ChatTranscriptHostingSupport {
         }
         if host.view.bounds.width <= 0 || host.view.bounds.height <= 0 {
             return .unavailable("empty-bounds")
-        }
-        if host.view.needsLayout {
-            return .unavailable("timeout")
         }
         return .hosted
     }
