@@ -42,6 +42,28 @@ final class ChatPerformanceInstrumentationTests: APIClientTestCase {
         XCTAssertNil(instrumentation.summary.counters[ChatPerformancePhase.eventHandling.rawValue])
     }
 
+    func testUIOwnedPhasesRecordOnceEachInSummaryKeys() {
+        let instrumentation = ChatPerformanceInstrumentation.shared
+        instrumentation.reset()
+
+        let phases: [ChatPerformancePhase] = [
+            .transcriptContentEvaluations,
+            .transcriptLayoutPasses,
+            .scrollMetricCallbacks,
+            .followScrollSchedules,
+            .followScrollFires,
+            .markdownBlocks,
+            .uncachedMathLayouts,
+            .streamingMarkdownSplits,
+            .fadeDraws,
+            .fadeTimelineFrames,
+        ]
+        for phase in phases {
+            instrumentation.record(phase)
+            XCTAssertEqual(instrumentation.summary.counters[phase.rawValue], 1)
+        }
+    }
+
     func testOwningCoordinatorAndViewModelPathsRecordSuccessCountersAndCloseInterval() async throws {
         let streamClient = ScriptedSSEStreamingClient(connectionScripts: [[
             .init(.token("Stable response")),

@@ -651,19 +651,3 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         XCTFail("Timed out waiting for scripted stream recovery")
     }
 }
-
-private struct CheapChatPerformanceEvidence: Codable {
-    let suite: String
-    let testName: String
-    let commit: String?
-    let rowCount: Int
-    let responseBytes: Int
-    let contentKind: ChatPerformanceContentKind
-    let samplesNanoseconds: [UInt64]
-    let p50Nanoseconds: UInt64
-    let p95Nanoseconds: UInt64
-    let p95Definition: String
-    let counters: [String: Int]
-    let closedIntervals: [String: Int]
-    let intervalDurationsNanoseconds: [String: UInt64]
-}

@@ -24,6 +24,16 @@ enum ChatPerformancePhase: String, CaseIterable, Codable {
     case streamConnections
     case streamIntervals
     case messageLoadIntervals
+    case transcriptContentEvaluations
+    case transcriptLayoutPasses
+    case scrollMetricCallbacks
+    case followScrollSchedules
+    case followScrollFires
+    case markdownBlocks
+    case uncachedMathLayouts
+    case streamingMarkdownSplits
+    case fadeDraws
+    case fadeTimelineFrames
 }
 
 struct ChatPerformanceSummary: Codable, Equatable {

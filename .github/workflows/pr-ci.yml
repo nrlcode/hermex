@@ -244,6 +244,10 @@ jobs:
               "chat-performance-replay-evidence.json",
               "chat-performance-matrix-mapping.json",
               "chat-performance-matrix-streaming.json",
+              "chat-performance-hosted-50-evidence.json",
+              "chat-performance-hosted-200-evidence.json",
+              "chat-performance-hosted-500-evidence.json",
+              "chat-performance-hosted-stream-evidence.json",
           )
 
           def as_evidence_objects(candidate):

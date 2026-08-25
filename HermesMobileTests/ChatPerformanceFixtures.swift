@@ -101,6 +101,73 @@ struct ChatPerformanceFixture {
         return ChatPerformanceFixture(scenario: scenario, messages: messages, response: response)
     }
 
+    static func hostedPaginationSessionJSON(
+        total: Int,
+        before: Int?,
+        largeAssistantContent: String? = nil
+    ) throws -> Data {
+        let pageEnd = before ?? total
+        let pageStart = max(0, pageEnd - 50)
+        let rows = (pageStart..<pageEnd).map { index in
+            hostedPaginationRow(
+                index: index,
+                total: total,
+                largeAssistantContent: largeAssistantContent
+            )
+        }
+        let payload: [String: Any] = [
+            "session": [
+                "session_id": "performance-session",
+                "messages": rows,
+                "_messages_truncated": pageStart > 0,
+                "_messages_offset": pageStart
+            ]
+        ]
+        return try JSONSerialization.data(withJSONObject: payload)
+    }
+
+    static func utf8Chunks(from data: Data, maxBytes: Int) -> [String] {
+        var chunks: [String] = []
+        var offset = 0
+        while offset < data.count {
+            var end = min(offset + maxBytes, data.count)
+            var advanced = false
+            while end > offset {
+                if let text = String(data: data.subdata(in: offset..<end), encoding: .utf8) {
+                    chunks.append(text)
+                    offset = end
+                    advanced = true
+                    break
+                }
+                end -= 1
+            }
+            if !advanced {
+                offset += 1
+            }
+        }
+        return chunks
+    }
+
+    private static func hostedPaginationRow(
+        index: Int,
+        total: Int,
+        largeAssistantContent: String?
+    ) -> [String: Any] {
+        let isLastAssistant = index == total - 1 && !index.isMultiple(of: 2)
+        let content: String
+        if isLastAssistant, let largeAssistantContent {
+            content = largeAssistantContent
+        } else {
+            content = self.content(for: index, contentKind: .markdown, toolState: .none)
+        }
+        return [
+            "role": index.isMultiple(of: 2) ? "user" : "assistant",
+            "content": content,
+            "_ts": Double(index),
+            "message_id": "performance-message-\(index)"
+        ]
+    }
+
     private static func role(for index: Int, contentKind: ChatPerformanceContentKind) -> String {
         if contentKind == .tool { return "tool" }
         return index.isMultiple(of: 2) ? "user" : "assistant"
@@ -127,4 +194,20 @@ struct ChatPerformanceFixture {
             return "read_file row \(index)\(suffix)"
         }
     }
+}
+
+struct CheapChatPerformanceEvidence: Codable {
+    let suite: String
+    let testName: String
+    let commit: String?
+    let rowCount: Int
+    let responseBytes: Int
+    let contentKind: ChatPerformanceContentKind
+    let samplesNanoseconds: [UInt64]
+    let p50Nanoseconds: UInt64
+    let p95Nanoseconds: UInt64
+    let p95Definition: String
+    let counters: [String: Int]
+    let closedIntervals: [String: Int]
+    let intervalDurationsNanoseconds: [String: UInt64]
 }
