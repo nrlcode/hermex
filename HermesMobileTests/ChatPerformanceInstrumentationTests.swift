@@ -154,11 +154,15 @@ final class ChatPerformanceInstrumentationTests: APIClientTestCase {
 
     @MainActor
     private func waitUntil(
+        timeout: TimeInterval = 2,
         _ condition: @MainActor () -> Bool
     ) async throws {
-        for _ in 0..<10_000 {
-            if condition() { return }
-            await Task.yield()
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for recovery")
     }

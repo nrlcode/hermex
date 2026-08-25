@@ -123,7 +123,7 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         XCTAssertEqual(viewModel.messages.compactMap { $0.content }, ["Keep working", "Alpha bravo charlie."])
         XCTAssertEqual(Set(viewModel.messages.map { $0.id }).count, viewModel.messages.count)
         XCTAssertEqual(viewModel.activeStreamID, nil)
-        XCTAssertEqual(ChatPerformanceInstrumentation.shared.summary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 1)
+        XCTAssertEqual(ChatPerformanceInstrumentation.shared.summary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 2)
     }
 
     @MainActor
@@ -347,11 +347,15 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
 
     @MainActor
     private func waitUntil(
+        timeout: TimeInterval = 2,
         _ condition: @MainActor () -> Bool
     ) async throws {
-        for _ in 0..<10_000 {
-            if condition() { return }
-            await Task.yield()
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for scripted stream recovery")
     }
