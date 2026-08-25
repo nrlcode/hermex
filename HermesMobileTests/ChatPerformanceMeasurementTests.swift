@@ -34,8 +34,8 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
             let client = makeClient { request in
                 let components = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)
                 let query = Dictionary(uniqueKeysWithValues: (components?.queryItems ?? []).map { ($0.name, $0.value) })
-                let before = query["msg_before"].flatMap(Int.init)
-                let limit = query["msg_limit"].flatMap(Int.init)
+                let before = query["msg_before"].flatMap { value in Int(value) }
+                let limit = query["msg_limit"].flatMap { value in Int(value) }
                 requests.append((before, limit))
 
                 let pageEnd = before ?? total
@@ -65,8 +65,8 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
             }
 
             XCTAssertEqual(viewModel.messages.count, total)
-            XCTAssertEqual(Set(viewModel.messages.map(\.id)).count, total)
-            XCTAssertEqual(viewModel.messages.map(\.id), viewModel.messages.map(\.id).sorted { lhs, rhs in
+            XCTAssertEqual(Set(viewModel.messages.map { $0.id }).count, total)
+            XCTAssertEqual(viewModel.messages.map { $0.id }, viewModel.messages.map { $0.id }.sorted { lhs, rhs in
                 let left = Int(lhs.split(separator: "-").last!)!
                 let right = Int(rhs.split(separator: "-").last!)!
                 return left < right
@@ -120,8 +120,8 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         try await waitUntil { streamClient.startedURLs.count == 2 }
         streamClient.playArmedConnectionScript()
 
-        XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working", "Alpha bravo charlie."])
-        XCTAssertEqual(Set(viewModel.messages.map(\.id)).count, viewModel.messages.count)
+        XCTAssertEqual(viewModel.messages.compactMap { $0.content }, ["Keep working", "Alpha bravo charlie."])
+        XCTAssertEqual(Set(viewModel.messages.map { $0.id }).count, viewModel.messages.count)
         XCTAssertEqual(viewModel.activeStreamID, nil)
         XCTAssertEqual(ChatPerformanceInstrumentation.shared.summary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 1)
     }
@@ -150,7 +150,7 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         let cancellationSummary = ChatPerformanceInstrumentation.shared.summary
         XCTAssertEqual(cancellationSummary.counters[ChatPerformancePhase.cancellations.rawValue], 1)
         XCTAssertEqual(cancellationSummary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 1)
-        XCTAssertEqual(cancellationViewModel.messages.compactMap(\.content), ["Cancel this", "Partial response"])
+        XCTAssertEqual(cancellationViewModel.messages.compactMap { $0.content }, ["Cancel this", "Partial response"])
 
         let errorClient = ScriptedSSEStreamingClient(connectionScripts: [[
             .init(.token("Before error")),
@@ -169,7 +169,7 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         XCTAssertEqual(errorSummary.counters[ChatPerformancePhase.errors.rawValue], 1)
         XCTAssertGreaterThanOrEqual(errorSummary.counters[ChatPerformancePhase.finalFlushes.rawValue] ?? 0, 1)
         XCTAssertEqual(errorSummary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 1)
-        XCTAssertEqual(errorViewModel.messages.compactMap(\.content), ["Handle error", "Before error"])
+        XCTAssertEqual(errorViewModel.messages.compactMap { $0.content }, ["Handle error", "Before error"])
     }
 
     func testFixtureContentGroupingAndExpansionKeepAnchorsStable() {
@@ -182,8 +182,8 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
             )
             let transcript = ChatViewModel.transcriptMessages(from: fixture.messages)
 
-            XCTAssertEqual(transcript.map(\.anchorID), fixture.messages.filter { $0.role != "tool" }.map(\.id))
-            XCTAssertEqual(transcript.map(\.id), transcript.map(\.id).sorted())
+            XCTAssertEqual(transcript.map { $0.anchorID }, fixture.messages.filter { $0.role != "tool" }.map { $0.id })
+            XCTAssertEqual(transcript.map { $0.id }, transcript.map { $0.id }.sorted())
             XCTAssertEqual(transcript.count, contentKind == .tool ? 0 : fixture.messages.count)
             XCTAssertTrue(fixture.messages.allSatisfy { message in
                 message.content?.isEmpty == false || message.reasoning?.isEmpty == false
@@ -272,21 +272,21 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
 
             XCTAssertEqual(groups.count, 1)
             XCTAssertEqual(fixture.scenario.toolState, toolState)
-            XCTAssertEqual(group.toolCalls.map(\.id), ["call-1", "call-2"])
-            XCTAssertEqual(group.toolCalls.map(\.name), ["read_file", "search_files"])
+            XCTAssertEqual(group.toolCalls.map { $0.id }, ["call-1", "call-2"])
+            XCTAssertEqual(group.toolCalls.map { $0.name }, ["read_file", "search_files"])
             XCTAssertTrue(group.toolCalls.allSatisfy { toolCall in
                 (toolCall.preview ?? "").hasSuffix(" output") == (toolState == .expanded)
             })
             XCTAssertEqual(
-                group.toolCalls.map(\.preview),
+                group.toolCalls.map { $0.preview },
                 [fixture.messages[0].content, fixture.messages[1].content]
             )
             XCTAssertEqual(group.anchorMessageID, "tool-assistant")
             XCTAssertEqual(group.anchorMessageID, transcript.last?.anchorID)
-            XCTAssertEqual(transcript.map(\.anchorID), ["tool-user", "tool-assistant"])
+            XCTAssertEqual(transcript.map { $0.anchorID }, ["tool-user", "tool-assistant"])
 
-            transcriptIDsByToolState.append(transcript.map(\.id))
-            anchorIDsByToolState.append(transcript.map(\.anchorID))
+            transcriptIDsByToolState.append(transcript.map { $0.id })
+            anchorIDsByToolState.append(transcript.map { $0.anchorID })
         }
 
         XCTAssertEqual(transcriptIDsByToolState.count, 2)
@@ -309,7 +309,7 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         ]
         let streamingTranscript = ChatViewModel.transcriptMessages(from: streaming)
         let completedTranscript = ChatViewModel.transcriptMessages(from: completed)
-        XCTAssertEqual(streamingTranscript.map(\.id), completedTranscript.map(\.id))
+        XCTAssertEqual(streamingTranscript.map { $0.id }, completedTranscript.map { $0.id })
         XCTAssertEqual(streamingTranscript.first?.anchorID, "user-1")
         XCTAssertEqual(streamingTranscript.last?.anchorID, "stream-1")
         XCTAssertEqual(completedTranscript.last?.anchorID, "assistant-1")
