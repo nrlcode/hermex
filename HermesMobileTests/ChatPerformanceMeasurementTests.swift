@@ -34,8 +34,8 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
             let client = makeClient { request in
                 let components = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)
                 let query = Dictionary(uniqueKeysWithValues: (components?.queryItems ?? []).map { ($0.name, $0.value) })
-                let before = query["msg_before"].flatMap { value in Int(value) }
-                let limit = query["msg_limit"].flatMap { value in Int(value) }
+                let before = (query["msg_before"] ?? nil).flatMap { Int($0) }
+                let limit = (query["msg_limit"] ?? nil).flatMap { Int($0) }
                 requests.append((before, limit))
 
                 let pageEnd = before ?? total
