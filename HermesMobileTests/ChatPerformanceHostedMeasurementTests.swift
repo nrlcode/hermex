@@ -164,6 +164,125 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
     }
 
     @MainActor
+    func testHostedStreamingAnimatedTranscriptMeasurementExportsLayoutEvidence() async throws {
+        UserDefaults.standard.set(true, forKey: StreamedTextAnimationSettings.isEnabledKey)
+        UIView.setAnimationsEnabled(true)
+
+        let fixture = ChatPerformanceFixture.make(
+            rowCount: 50,
+            responseBytes: 4_096,
+            contentKind: .markdown,
+            animationEnabled: true
+        )
+        let largeContent = String(decoding: fixture.response, as: UTF8.self)
+        XCTAssertEqual(largeContent.utf8.count, 4096)
+        let chunks = ChatPerformanceFixture.utf8Chunks(from: fixture.response, maxBytes: 512)
+        XCTAssertEqual(chunks.count, 8)
+        XCTAssertEqual(chunks.joined().utf8.count, 4096)
+
+        let streamClient = ScriptedSSEStreamingClient(connectionScripts: [[]])
+        let viewModel = try makeStreamingViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/session":
+                return try self.hostedSessionResponse(
+                    total: 50,
+                    request: request,
+                    largeAssistantContent: nil
+                )
+            case "/api/chat/start":
+                return apiTestJSONResponse(
+                    #"{"session_id":"performance-session","stream_id":"hosted-stream"}"#,
+                    for: request
+                )
+            default:
+                XCTFail("Unexpected request path \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.loadMessages()
+        while viewModel.hasOlderMessages {
+            _ = await viewModel.loadOlderMessages()
+        }
+        XCTAssertEqual(viewModel.messages.count, 50)
+
+        ChatPerformanceInstrumentation.shared.reset()
+        let (window, host) = ChatTranscriptHostingSupport.host(
+            ChatTranscriptHostingSupport.transcriptView(from: viewModel),
+            animationsEnabled: true
+        )
+        hostedWindow = window
+
+        var samples: [UInt64] = []
+        let deadline = Date().addingTimeInterval(45)
+        let didStart = await viewModel.sendMessage("Measure hosted stream")
+        XCTAssertTrue(didStart)
+
+        for (index, chunk) in chunks.enumerated() {
+            streamClient.emit(
+                .token(chunk),
+                lastEventID: "hosted-stream:\(index + 1)"
+            )
+            ChatTranscriptHostingSupport.applySnapshot(
+                ChatTranscriptHostingSupport.transcriptView(from: viewModel),
+                to: host,
+                animationsEnabled: true
+            )
+            try await collectLayoutSample(
+                window: window,
+                host: host,
+                deadline: deadline,
+                samples: &samples,
+                suite: "hosted-streaming-animated",
+                testName: "testHostedStreamingAnimatedTranscriptMeasurementExportsLayoutEvidence",
+                rowCount: 50,
+                attachmentName: "chat-performance-hosted-stream-animated-evidence.json",
+                logMarker: "HERMEX_SLICE2_ANIM_EVIDENCE"
+            )
+        }
+
+        streamClient.emit(.done(DoneStreamEvent()))
+        streamClient.emit(.streamEnd)
+        ChatTranscriptHostingSupport.applySnapshot(
+            ChatTranscriptHostingSupport.transcriptView(from: viewModel),
+            to: host,
+            animationsEnabled: true
+        )
+        try await collectLayoutSample(
+            window: window,
+            host: host,
+            deadline: deadline,
+            samples: &samples,
+            suite: "hosted-streaming-animated",
+            testName: "testHostedStreamingAnimatedTranscriptMeasurementExportsLayoutEvidence",
+            rowCount: 50,
+            attachmentName: "chat-performance-hosted-stream-animated-evidence.json",
+            logMarker: "HERMEX_SLICE2_ANIM_EVIDENCE"
+        )
+
+        try assertHostedSuccess(
+            viewModel: viewModel,
+            samples: samples,
+            suite: "hosted-streaming-animated",
+            testName: "testHostedStreamingAnimatedTranscriptMeasurementExportsLayoutEvidence",
+            rowCount: 50,
+            attachmentName: "chat-performance-hosted-stream-animated-evidence.json",
+            logMarker: "HERMEX_SLICE2_ANIM_EVIDENCE"
+        )
+
+        let fadeFrames = ChatPerformanceInstrumentation.shared.summary.counters[
+            ChatPerformancePhase.fadeTimelineFrames.rawValue
+        ] ?? 0
+        let fadeDraws = ChatPerformanceInstrumentation.shared.summary.counters[
+            ChatPerformancePhase.fadeDraws.rawValue
+        ] ?? 0
+        if fadeFrames == 0 && fadeDraws == 0 {
+            throw XCTSkip("hosted transcript unavailable: fade-inactive")
+        }
+        XCTAssertTrue(fadeFrames > 0 || fadeDraws > 0)
+    }
+
+    @MainActor
     private func measureHostedStaticTranscript(rowCount: Int) async throws {
         let viewModel = try await loadPaginatedViewModel(
             rowCount: rowCount,
@@ -212,7 +331,8 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         suite: String,
         testName: String,
         rowCount: Int,
-        attachmentName: String
+        attachmentName: String,
+        logMarker: String = "HERMEX_PERF_EVIDENCE"
     ) throws {
         let view = ChatTranscriptHostingSupport.transcriptView(from: viewModel)
         XCTAssertEqual(view.displayedTranscriptMessages.count, viewModel.displayedTranscriptMessages.count)
@@ -242,7 +362,8 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
             p95Definition: "max of \(samples.count) hosted layout samples (n=\(samples.count), no interpolation)",
             attachmentName: attachmentName,
             p50: p50,
-            p95: p95
+            p95: p95,
+            logMarker: logMarker
         )
     }
 
@@ -255,7 +376,8 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         suite: String,
         testName: String,
         rowCount: Int,
-        attachmentName: String
+        attachmentName: String,
+        logMarker: String = "HERMEX_PERF_EVIDENCE"
     ) async throws {
         let remaining = deadline.timeIntervalSinceNow
         if remaining <= 0 {
@@ -265,7 +387,8 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
                 rowCount: rowCount,
                 samples: [],
                 p95Definition: "unavailable: timeout",
-                attachmentName: attachmentName
+                attachmentName: attachmentName,
+                logMarker: logMarker
             )
             throw XCTSkip("hosted transcript unavailable: timeout")
         }
@@ -284,7 +407,8 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
                 rowCount: rowCount,
                 samples: [],
                 p95Definition: "unavailable: \(reason)",
-                attachmentName: attachmentName
+                attachmentName: attachmentName,
+                logMarker: logMarker
             )
             throw XCTSkip("hosted transcript unavailable: \(reason)")
         }
@@ -300,7 +424,8 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         p95Definition: String,
         attachmentName: String,
         p50: UInt64 = 0,
-        p95: UInt64 = 0
+        p95: UInt64 = 0,
+        logMarker: String = "HERMEX_PERF_EVIDENCE"
     ) throws {
         let summary = ChatPerformanceInstrumentation.shared.summary
         let evidence = CheapChatPerformanceEvidence(
@@ -322,7 +447,7 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(evidence)
         let json = String(decoding: data, as: UTF8.self)
-        let line = "HERMEX_PERF_EVIDENCE " + json
+        let line = logMarker + " " + json
         print(line)
         FileHandle.standardError.write(Data((line + "\n").utf8))
         let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
