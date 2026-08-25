@@ -201,7 +201,7 @@ final class ChatViewModel {
     private static let messagePageLimit = 50
 
     private(set) var messages: [ChatMessage] = [] {
-        didSet { recomputeDisplayedTranscriptMessages() }
+        didSet { updateDisplayedTranscriptMessages(from: oldValue) }
     }
     /// Memoized transcript mapping, recomputed once whenever `messages` or
     /// `messagesOffset` changes. Views read this single cached value instead of
@@ -277,6 +277,63 @@ final class ChatViewModel {
             from: messages,
             messageOffset: messagesOffset
         )
+        recomputeCompressionReferenceCard()
+    }
+
+    private func updateDisplayedTranscriptMessages(from oldValue: [ChatMessage]) {
+        // Count, identity, filter, or anchor changes fail closed to a full remap.
+        guard oldValue.count == messages.count else {
+            recomputeDisplayedTranscriptMessages()
+            return
+        }
+        if oldValue.elementsEqual(messages) {
+            return
+        }
+
+        let changed = messages.indices.filter { oldValue[$0] != messages[$0] }
+        guard changed.count == 1, let changedIndex = changed.first else {
+            recomputeDisplayedTranscriptMessages()
+            return
+        }
+
+        let oldMessage = oldValue[changedIndex]
+        let newMessage = messages[changedIndex]
+        if oldMessage.role != newMessage.role || oldMessage.messageId != newMessage.messageId {
+            recomputeDisplayedTranscriptMessages()
+            return
+        }
+        if oldMessage.role == "tool"
+            || newMessage.role == "tool"
+            || TranscriptTurnClassifier.isToolResultOnlyMessage(oldMessage)
+            || TranscriptTurnClassifier.isToolResultOnlyMessage(newMessage)
+        {
+            recomputeDisplayedTranscriptMessages()
+            return
+        }
+        guard let displayedIndex = displayedTranscriptMessages.firstIndex(where: { $0.loadedIndex == changedIndex }) else {
+            recomputeDisplayedTranscriptMessages()
+            return
+        }
+        let existing = displayedTranscriptMessages[displayedIndex]
+        let nextAnchorID = TranscriptTurnClassifier.anchorID(
+            for: newMessage,
+            at: changedIndex,
+            messageOffset: messagesOffset
+        )
+        guard existing.anchorID == nextAnchorID else {
+            recomputeDisplayedTranscriptMessages()
+            return
+        }
+
+        var next = displayedTranscriptMessages
+        next[displayedIndex] = TranscriptMessage(
+            loadedIndex: existing.loadedIndex,
+            renderID: existing.renderID,
+            anchorID: existing.anchorID,
+            message: newMessage
+        )
+        displayedTranscriptMessages = next
+        ChatPerformanceInstrumentation.shared.record(.transcriptMappingRows, units: 1)
         recomputeCompressionReferenceCard()
     }
     /// Synthesized "Context compaction · Reference only" card resolved from the
