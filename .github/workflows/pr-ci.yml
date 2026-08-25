@@ -239,14 +239,30 @@ jobs:
               for root in results.get("testNodes", []):
                   visit(root, [])
 
-          def as_evidence_json(candidate):
+          ATTACHMENT_KEYS = {
+              "chat-performance-evidence.json": "cheap",
+              "chat-performance-replay-evidence.json": "replay",
+          }
+
+          def as_evidence_object(candidate):
               try:
                   parsed = json.loads(candidate)
               except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
                   return None
               if not isinstance(parsed, dict) or "samplesNanoseconds" not in parsed:
                   return None
-              return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+              return parsed
+
+          def classify_evidence(parsed):
+              name = str(parsed.get("testName") or "")
+              if "Replay" in name:
+                  return "replay"
+              if "Cheap" in name:
+                  return "cheap"
+              definition = str(parsed.get("p95Definition") or "")
+              if "single replay" in definition:
+                  return "replay"
+              return None
 
           def decompress_zstd(payload):
               try:
@@ -273,29 +289,33 @@ jobs:
               except (OSError, subprocess.CalledProcessError):
                   return None
 
-          evidence_text = None
+          collected = {}
           marker = "HERMEX_PERF_EVIDENCE "
           if log_path.is_file():
               for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
                   idx = line.find(marker)
                   if idx == -1:
                       continue
-                  found = as_evidence_json(line[idx + len(marker):].strip())
-                  if found is not None:
-                      evidence_text = found
+                  found = as_evidence_object(line[idx + len(marker):].strip())
+                  if found is None:
+                      continue
+                  key = classify_evidence(found)
+                  if key is not None:
+                      collected[key] = found
 
           db_path = result_bundle / "database.sqlite3"
-          if evidence_text is None and db_path.is_file():
+          if db_path.is_file():
               connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
               try:
                   rows = connection.execute(
-                      "SELECT xcResultKitPayloadRefId FROM Attachments WHERE name = ?",
-                      ("chat-performance-evidence.json",),
+                      "SELECT name, xcResultKitPayloadRefId FROM Attachments WHERE name IN (?, ?)",
+                      tuple(ATTACHMENT_KEYS),
                   ).fetchall()
               finally:
                   connection.close()
-              for (ref_id,) in rows:
-                  if not ref_id:
+              for name, ref_id in rows:
+                  key = ATTACHMENT_KEYS.get(name)
+                  if key is None or key in collected or not ref_id:
                       continue
                   payload_path = result_bundle / "Data" / f"data.{ref_id}"
                   if not payload_path.is_file():
@@ -303,12 +323,13 @@ jobs:
                   decoded = decompress_zstd(payload_path.read_bytes())
                   if not decoded:
                       continue
-                  found = as_evidence_json(decoded.decode("utf-8", errors="replace"))
+                  found = as_evidence_object(decoded.decode("utf-8", errors="replace"))
                   if found is not None:
-                      evidence_text = found
-                      break
+                      collected[key] = found
 
-          if evidence_text is not None:
+          evidence_text = None
+          if collected:
+              evidence_text = json.dumps(collected, sort_keys=True, separators=(",", ":"))
               evidence_path.write_text(evidence_text + "\n", encoding="utf-8")
 
           lines = [

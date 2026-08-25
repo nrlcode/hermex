@@ -144,16 +144,53 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         }
 
         ChatPerformanceInstrumentation.shared.reset()
+        let replayStart = DispatchTime.now().uptimeNanoseconds
         let didStart = await viewModel.sendMessage("Keep working")
         XCTAssertTrue(didStart)
         streamClient.playArmedConnectionScript()
         try await waitUntil { streamClient.startedURLs.count == 2 }
         streamClient.playArmedConnectionScript()
+        let replayNanoseconds = DispatchTime.now().uptimeNanoseconds &- replayStart
 
         XCTAssertEqual(viewModel.messages.compactMap { $0.content }, ["Keep working", "Alpha bravo charlie."])
         XCTAssertEqual(Set(viewModel.messages.map { $0.id }).count, viewModel.messages.count)
         XCTAssertEqual(viewModel.activeStreamID, nil)
         XCTAssertEqual(ChatPerformanceInstrumentation.shared.summary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 2)
+
+        let assistantContent = viewModel.messages.compactMap { $0.content }.last ?? ""
+        let summary = ChatPerformanceInstrumentation.shared.summary
+        let evidence = CheapChatPerformanceEvidence(
+            testName: "testFixtureDrivenReplayPreservesOrderingDeduplicationAndFinalFlush",
+            commit: ProcessInfo.processInfo.environment["GITHUB_SHA"],
+            rowCount: viewModel.messages.count,
+            responseBytes: assistantContent.utf8.count,
+            contentKind: .plain,
+            samplesNanoseconds: [replayNanoseconds],
+            p50Nanoseconds: replayNanoseconds,
+            p95Nanoseconds: replayNanoseconds,
+            p95Definition: "single replay wall-clock sample (n=1)",
+            counters: summary.counters,
+            closedIntervals: summary.closedIntervals,
+            intervalDurationsNanoseconds: summary.intervalDurationsNanoseconds
+        )
+        XCTAssertEqual(evidence.rowCount, 2)
+        XCTAssertEqual(evidence.responseBytes, 20)
+        XCTAssertEqual(evidence.contentKind, .plain)
+        XCTAssertEqual(evidence.samplesNanoseconds, [replayNanoseconds])
+        XCTAssertEqual(evidence.p50Nanoseconds, replayNanoseconds)
+        XCTAssertEqual(evidence.p95Nanoseconds, replayNanoseconds)
+        XCTAssertEqual(evidence.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 2)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(evidence)
+        let json = String(decoding: data, as: UTF8.self)
+        let line = "HERMEX_PERF_EVIDENCE " + json
+        print(line)
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+        let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+        attachment.name = "chat-performance-replay-evidence.json"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     @MainActor
