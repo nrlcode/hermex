@@ -92,11 +92,11 @@ final class ChatStreamCoordinator {
     private(set) var recoveryState: ActiveStreamRecoveryState = .idle
     private(set) var isConnectionSuspended = false
     private(set) var hasCompletedCurrentResponse = false
-    private(set) var lastEventID: String?
-    private(set) var lastProgressDate: Date?
-    private(set) var lastTransportActivityDate: Date?
+    @ObservationIgnored private(set) var lastEventID: String?
+    @ObservationIgnored private(set) var lastProgressDate: Date?
+    @ObservationIgnored private(set) var lastTransportActivityDate: Date?
     private(set) var liveTokensPerSecond: Double?
-    private var lastRecoveryStatusCheckDate: Date?
+    @ObservationIgnored private var lastRecoveryStatusCheckDate: Date?
     private(set) var isReplayConnection = false
     // Bumped whenever the active run starts or finalizes. Captured before an async
     // transcript load so a concurrent cancel/completion during the load can't be
@@ -407,7 +407,10 @@ final class ChatStreamCoordinator {
         lastProgressDate = now
         lastTransportActivityDate = now
         lastRecoveryStatusCheckDate = nil
-        recoveryState = .idle
+        // Observation notifies on assign, not on Equatable.
+        if recoveryState != .idle {
+            recoveryState = .idle
+        }
     }
 
     func clearReplayConnection() {
@@ -484,7 +487,11 @@ final class ChatStreamCoordinator {
             guard payload.sessionId == nil || payload.sessionId == delegate?.streamCoordinatorSessionID else {
                 break
             }
-            liveTokensPerSecond = payload.displayableTokensPerSecond
+            let next = payload.displayableTokensPerSecond
+            // Observation notifies on assign, not on Equatable.
+            if liveTokensPerSecond != next {
+                liveTokensPerSecond = next
+            }
         case .done(let payload):
             ChatPerformanceInstrumentation.shared.record(.done)
             let hasCompletedTranscript = delegate?.streamCoordinatorApplyDone(payload) == true
