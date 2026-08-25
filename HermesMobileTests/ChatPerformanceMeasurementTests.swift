@@ -48,7 +48,9 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(evidence)
         let json = String(decoding: data, as: UTF8.self)
-        print("HERMEX_PERF_EVIDENCE " + json)
+        let line = "HERMEX_PERF_EVIDENCE " + json
+        print(line)
+        FileHandle.standardError.write(Data((line + "\n").utf8))
         let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
         attachment.name = "chat-performance-evidence.json"
         attachment.lifetime = .keepAlways

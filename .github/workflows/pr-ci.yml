@@ -197,14 +197,18 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import ctypes
           import json
           import os
+          import sqlite3
+          import subprocess
           from pathlib import Path
 
           summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
           results_path = Path("test-results.json")
           log_path = Path("xcodebuild-test.log")
           evidence_path = Path("chat-performance-evidence.json")
+          result_bundle = Path(os.environ.get("RESULT_BUNDLE_PATH", "TestResults.xcresult"))
 
           total = passed = failed = skipped = 0
           perf_rows = []
@@ -235,6 +239,40 @@ jobs:
               for root in results.get("testNodes", []):
                   visit(root, [])
 
+          def as_evidence_json(candidate):
+              try:
+                  parsed = json.loads(candidate)
+              except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                  return None
+              if not isinstance(parsed, dict) or "samplesNanoseconds" not in parsed:
+                  return None
+              return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+
+          def decompress_zstd(payload):
+              try:
+                  lib = ctypes.CDLL("/usr/lib/libcompression.dylib")
+                  lib.compression_decode_buffer.argtypes = [
+                      ctypes.c_void_p, ctypes.c_size_t,
+                      ctypes.c_void_p, ctypes.c_size_t,
+                      ctypes.c_void_p, ctypes.c_int,
+                  ]
+                  lib.compression_decode_buffer.restype = ctypes.c_ssize_t
+                  dst = ctypes.create_string_buffer(max(len(payload) * 32, 65536))
+                  src = ctypes.create_string_buffer(payload, len(payload))
+                  n = lib.compression_decode_buffer(
+                      ctypes.addressof(dst), len(dst),
+                      ctypes.addressof(src), len(payload),
+                      None, 0x103,
+                  )
+                  if n > 0:
+                      return dst.raw[:n]
+              except (OSError, AttributeError, ValueError):
+                  pass
+              try:
+                  return subprocess.check_output(["zstd", "-d", "-c"], input=payload)
+              except (OSError, subprocess.CalledProcessError):
+                  return None
+
           evidence_text = None
           marker = "HERMEX_PERF_EVIDENCE "
           if log_path.is_file():
@@ -242,12 +280,34 @@ jobs:
                   idx = line.find(marker)
                   if idx == -1:
                       continue
-                  candidate = line[idx + len(marker):].strip()
-                  try:
-                      parsed = json.loads(candidate)
-                  except json.JSONDecodeError:
+                  found = as_evidence_json(line[idx + len(marker):].strip())
+                  if found is not None:
+                      evidence_text = found
+
+          db_path = result_bundle / "database.sqlite3"
+          if evidence_text is None and db_path.is_file():
+              connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+              try:
+                  rows = connection.execute(
+                      "SELECT xcResultKitPayloadRefId FROM Attachments WHERE name = ?",
+                      ("chat-performance-evidence.json",),
+                  ).fetchall()
+              finally:
+                  connection.close()
+              for (ref_id,) in rows:
+                  if not ref_id:
                       continue
-                  evidence_text = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+                  payload_path = result_bundle / "Data" / f"data.{ref_id}"
+                  if not payload_path.is_file():
+                      continue
+                  decoded = decompress_zstd(payload_path.read_bytes())
+                  if not decoded:
+                      continue
+                  found = as_evidence_json(decoded.decode("utf-8", errors="replace"))
+                  if found is not None:
+                      evidence_text = found
+                      break
+
           if evidence_text is not None:
               evidence_path.write_text(evidence_text + "\n", encoding="utf-8")
 
@@ -273,8 +333,10 @@ jobs:
               lines.extend(["```json", evidence_text, "```"])
           else:
               lines.append("not found")
+          text = "\n".join(lines) + "\n"
+          print(text)
           with summary_path.open("a", encoding="utf-8") as summary_file:
-              summary_file.write("\n".join(lines) + "\n")
+              summary_file.write(text)
           PY
 
       - name: Upload test results
