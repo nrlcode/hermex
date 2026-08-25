@@ -3,7 +3,8 @@ import XCTest
 @testable import HermesMobile
 
 final class ChatPerformanceMeasurementTests: APIClientTestCase {
-    func testCheapBoundedMeasurementCapturesSamplesWithoutPacingSleeps() {
+    @MainActor
+    func testCheapBoundedMeasurementCapturesSamplesWithoutPacingSleeps() throws {
         let fixture = ChatPerformanceFixture.make(
             rowCount: 50,
             responseBytes: 4_096,
@@ -14,6 +15,7 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         for _ in 0..<2 {
             _ = ChatViewModel.transcriptMessages(from: fixture.messages, messageOffset: 0)
         }
+        ChatPerformanceInstrumentation.shared.reset()
         for _ in 0..<3 {
             let start = DispatchTime.now().uptimeNanoseconds
             let mapped = ChatViewModel.transcriptMessages(from: fixture.messages, messageOffset: 0)
@@ -25,6 +27,32 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         XCTAssertEqual(sortedSamples.count, 3)
         XCTAssertGreaterThanOrEqual(sortedSamples[1], sortedSamples[0])
         XCTAssertGreaterThanOrEqual(sortedSamples[2], sortedSamples[1])
+
+        // n=3: p50 is the median (sorted[1]); p95 is the max. No interpolation.
+        let summary = ChatPerformanceInstrumentation.shared.summary
+        let evidence = CheapChatPerformanceEvidence(
+            testName: "testCheapBoundedMeasurementCapturesSamplesWithoutPacingSleeps",
+            commit: ProcessInfo.processInfo.environment["GITHUB_SHA"],
+            rowCount: fixture.scenario.rowCount,
+            responseBytes: fixture.scenario.responseBytes,
+            contentKind: fixture.scenario.contentKind,
+            samplesNanoseconds: samples,
+            p50Nanoseconds: sortedSamples[1],
+            p95Nanoseconds: sortedSamples[2],
+            p95Definition: "max of 3 samples (n=3, no interpolation)",
+            counters: summary.counters,
+            closedIntervals: summary.closedIntervals,
+            intervalDurationsNanoseconds: summary.intervalDurationsNanoseconds
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(evidence)
+        let json = String(decoding: data, as: UTF8.self)
+        print("HERMEX_PERF_EVIDENCE " + json)
+        let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+        attachment.name = "chat-performance-evidence.json"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     @MainActor
@@ -359,4 +387,19 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         }
         XCTFail("Timed out waiting for scripted stream recovery")
     }
+}
+
+private struct CheapChatPerformanceEvidence: Codable {
+    let testName: String
+    let commit: String?
+    let rowCount: Int
+    let responseBytes: Int
+    let contentKind: ChatPerformanceContentKind
+    let samplesNanoseconds: [UInt64]
+    let p50Nanoseconds: UInt64
+    let p95Nanoseconds: UInt64
+    let p95Definition: String
+    let counters: [String: Int]
+    let closedIntervals: [String: Int]
+    let intervalDurationsNanoseconds: [String: UInt64]
 }
