@@ -31,6 +31,7 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         // n=3: p50 is the median (sorted[1]); p95 is the max. No interpolation.
         let summary = ChatPerformanceInstrumentation.shared.summary
         let evidence = CheapChatPerformanceEvidence(
+            suite: "cheap",
             testName: "testCheapBoundedMeasurementCapturesSamplesWithoutPacingSleeps",
             commit: ProcessInfo.processInfo.environment["GITHUB_SHA"],
             rowCount: fixture.scenario.rowCount,
@@ -160,6 +161,7 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         let assistantContent = viewModel.messages.compactMap { $0.content }.last ?? ""
         let summary = ChatPerformanceInstrumentation.shared.summary
         let evidence = CheapChatPerformanceEvidence(
+            suite: "replay",
             testName: "testFixtureDrivenReplayPreservesOrderingDeduplicationAndFinalFlush",
             commit: ProcessInfo.processInfo.environment["GITHUB_SHA"],
             rowCount: viewModel.messages.count,
@@ -237,6 +239,164 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         XCTAssertGreaterThanOrEqual(errorSummary.counters[ChatPerformancePhase.finalFlushes.rawValue] ?? 0, 1)
         XCTAssertEqual(errorSummary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue], 1)
         XCTAssertEqual(errorViewModel.messages.compactMap { $0.content }, ["Handle error", "Before error"])
+    }
+
+    @MainActor
+    func testMappingMatrixMeasuresHistoricalRowsPlusCompletedAssistantResponse() throws {
+        var cells: [CheapChatPerformanceEvidence] = []
+        for rowCount in ChatPerformanceFixture.rowCounts {
+            for responseBytes in ChatPerformanceFixture.responseByteLengths {
+                let fixture = ChatPerformanceFixture.make(
+                    rowCount: rowCount,
+                    responseBytes: responseBytes,
+                    contentKind: .markdown
+                )
+                let largeContent = String(decoding: fixture.response, as: UTF8.self)
+                XCTAssertEqual(fixture.response.count, responseBytes)
+                XCTAssertEqual(largeContent.utf8.count, responseBytes)
+
+                var messages = fixture.messages
+                messages.append(
+                    ChatMessage(
+                        role: "assistant",
+                        content: largeContent,
+                        timestamp: Double(rowCount),
+                        messageId: "performance-mapping-assistant-\(rowCount)-\(responseBytes)"
+                    )
+                )
+
+                var samples: [UInt64] = []
+                for _ in 0..<2 {
+                    _ = ChatViewModel.transcriptMessages(from: messages, messageOffset: 0)
+                }
+                ChatPerformanceInstrumentation.shared.reset()
+                for _ in 0..<3 {
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    let mapped = ChatViewModel.transcriptMessages(from: messages, messageOffset: 0)
+                    samples.append(DispatchTime.now().uptimeNanoseconds &- start)
+                    XCTAssertEqual(mapped.count, messages.count)
+                    XCTAssertEqual(mapped.last?.message.content?.utf8.count, responseBytes)
+                }
+
+                let sortedSamples = samples.sorted()
+                XCTAssertEqual(sortedSamples.count, 3)
+                let summary = ChatPerformanceInstrumentation.shared.summary
+                let evidence = CheapChatPerformanceEvidence(
+                    suite: "mapping",
+                    testName: "testMappingMatrixMeasuresHistoricalRowsPlusCompletedAssistantResponse",
+                    commit: ProcessInfo.processInfo.environment["GITHUB_SHA"],
+                    rowCount: rowCount,
+                    responseBytes: responseBytes,
+                    contentKind: .markdown,
+                    samplesNanoseconds: samples,
+                    p50Nanoseconds: sortedSamples[1],
+                    p95Nanoseconds: sortedSamples[2],
+                    p95Definition: "max of 3 samples (n=3, no interpolation)",
+                    counters: summary.counters,
+                    closedIntervals: summary.closedIntervals,
+                    intervalDurationsNanoseconds: summary.intervalDurationsNanoseconds
+                )
+                try publishEvidence(evidence)
+                cells.append(evidence)
+            }
+        }
+
+        XCTAssertEqual(cells.count, 9)
+        try attachJSONArray(cells, name: "chat-performance-matrix-mapping.json")
+    }
+
+    @MainActor
+    func testStreamingMatrixMeasuresScriptedTokensThroughRealPaginationSeam() async throws {
+        var cells: [CheapChatPerformanceEvidence] = []
+        for rowCount in ChatPerformanceFixture.rowCounts {
+            for responseBytes in ChatPerformanceFixture.responseByteLengths {
+                let fixture = ChatPerformanceFixture.make(
+                    rowCount: rowCount,
+                    responseBytes: responseBytes,
+                    contentKind: .markdown
+                )
+                let largeContent = String(decoding: fixture.response, as: UTF8.self)
+                XCTAssertEqual(largeContent.utf8.count, responseBytes)
+                let chunks = Self.utf8TokenChunks(from: fixture.response)
+                XCTAssertEqual(chunks.joined().utf8.count, responseBytes)
+                XCTAssertFalse(chunks.isEmpty)
+                XCTAssertTrue(chunks.dropLast().allSatisfy { $0.utf8.count == 256 })
+                XCTAssertLessThanOrEqual(chunks.last?.utf8.count ?? 0, 256)
+
+                var script = chunks.enumerated().map { index, chunk in
+                    ScriptedSSEStreamingClient.ScriptedEvent(
+                        .token(chunk),
+                        lastEventID: "stream-matrix-\(rowCount)-\(responseBytes):\(index + 1)"
+                    )
+                }
+                script.append(.init(.done(DoneStreamEvent())))
+                script.append(.init(.streamEnd))
+
+                let streamClient = ScriptedSSEStreamingClient(connectionScripts: [script])
+                let viewModel = try makeStreamingViewModel(streamClient: streamClient) { request in
+                    switch request.url?.path {
+                    case "/api/session":
+                        return try self.paginationSessionResponse(total: rowCount, request: request)
+                    case "/api/chat/start":
+                        return apiTestJSONResponse(
+                            #"{"session_id":"performance-session","stream_id":"stream-matrix"}"#,
+                            for: request
+                        )
+                    default:
+                        XCTFail("Unexpected request path \(request.url?.path ?? "nil")")
+                        throw URLError(.badURL)
+                    }
+                }
+
+                await viewModel.loadMessages()
+                while viewModel.hasOlderMessages {
+                    _ = await viewModel.loadOlderMessages()
+                }
+                XCTAssertEqual(viewModel.messages.count, rowCount)
+                XCTAssertEqual(Set(viewModel.messages.map { $0.id }).count, rowCount)
+
+                ChatPerformanceInstrumentation.shared.reset()
+                let streamStart = DispatchTime.now().uptimeNanoseconds
+                let didStart = await viewModel.sendMessage("Measure stream")
+                XCTAssertTrue(didStart)
+                streamClient.playArmedConnectionScript()
+                let streamNanoseconds = DispatchTime.now().uptimeNanoseconds &- streamStart
+
+                XCTAssertEqual(viewModel.messages.last?.role, "assistant")
+                XCTAssertEqual(viewModel.messages.last?.content?.utf8.count, responseBytes)
+                XCTAssertEqual(viewModel.messages.last?.content, largeContent)
+                XCTAssertEqual(Set(viewModel.messages.map { $0.id }).count, viewModel.messages.count)
+                XCTAssertNil(viewModel.activeStreamID)
+
+                let summary = ChatPerformanceInstrumentation.shared.summary
+                XCTAssertGreaterThanOrEqual(
+                    summary.closedIntervals[ChatPerformancePhase.streamIntervals.rawValue] ?? 0,
+                    1
+                )
+                XCTAssertFalse(summary.counters.isEmpty)
+
+                let evidence = CheapChatPerformanceEvidence(
+                    suite: "streaming",
+                    testName: "testStreamingMatrixMeasuresScriptedTokensThroughRealPaginationSeam",
+                    commit: ProcessInfo.processInfo.environment["GITHUB_SHA"],
+                    rowCount: rowCount,
+                    responseBytes: responseBytes,
+                    contentKind: .markdown,
+                    samplesNanoseconds: [streamNanoseconds],
+                    p50Nanoseconds: streamNanoseconds,
+                    p95Nanoseconds: streamNanoseconds,
+                    p95Definition: "single streaming wall-clock sample (n=1)",
+                    counters: summary.counters,
+                    closedIntervals: summary.closedIntervals,
+                    intervalDurationsNanoseconds: summary.intervalDurationsNanoseconds
+                )
+                try publishEvidence(evidence)
+                cells.append(evidence)
+            }
+        }
+
+        XCTAssertEqual(cells.count, 9)
+        try attachJSONArray(cells, name: "chat-performance-matrix-streaming.json")
     }
 
     func testFixtureContentGroupingAndExpansionKeepAnchorsStable() {
@@ -412,6 +572,70 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
         return viewModel
     }
 
+    private func publishEvidence(_ evidence: CheapChatPerformanceEvidence) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(evidence)
+        let json = String(decoding: data, as: UTF8.self)
+        let line = "HERMEX_PERF_EVIDENCE " + json
+        print(line)
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+
+    private func attachJSONArray(_ cells: [CheapChatPerformanceEvidence], name: String) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(cells)
+        let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func paginationSessionResponse(
+        total: Int,
+        request: URLRequest
+    ) throws -> (HTTPURLResponse, Data) {
+        let components = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)
+        let query = Dictionary(uniqueKeysWithValues: (components?.queryItems ?? []).map { ($0.name, $0.value) })
+        let before = (query["msg_before"] ?? nil).flatMap { Int($0) }
+        let pageEnd = before ?? total
+        let pageStart = max(0, pageEnd - 50)
+        let rows = (pageStart..<pageEnd).map(Self.messageJSON)
+        let payload: [String: Any] = [
+            "session": [
+                "session_id": "performance-session",
+                "messages": rows,
+                "_messages_truncated": pageStart > 0,
+                "_messages_offset": pageStart
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        return apiTestJSONResponse(String(decoding: data, as: UTF8.self), for: request)
+    }
+
+    private static func utf8TokenChunks(from data: Data, maxBytes: Int = 256) -> [String] {
+        var chunks: [String] = []
+        var offset = 0
+        while offset < data.count {
+            var end = min(offset + maxBytes, data.count)
+            var advanced = false
+            while end > offset {
+                if let text = String(data: data.subdata(in: offset..<end), encoding: .utf8) {
+                    chunks.append(text)
+                    offset = end
+                    advanced = true
+                    break
+                }
+                end -= 1
+            }
+            if !advanced {
+                offset += 1
+            }
+        }
+        return chunks
+    }
+
     @MainActor
     private func waitUntil(
         timeout: TimeInterval = 2,
@@ -429,6 +653,7 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
 }
 
 private struct CheapChatPerformanceEvidence: Codable {
+    let suite: String
     let testName: String
     let commit: String?
     let rowCount: Int
