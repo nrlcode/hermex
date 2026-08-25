@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import UIKit
 import XCTest
 @testable import HermesMobile
