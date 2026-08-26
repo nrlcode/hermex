@@ -2004,17 +2004,66 @@ final class ChatViewModelSendTests: XCTestCase {
         let didStart = await viewModel.sendMessage("Stream a long response")
         XCTAssertTrue(didStart)
         assertMemoMatchesPureMapping("memo should match after the optimistic append")
+        XCTAssertEqual(viewModel.messages.count, 1)
+        XCTAssertEqual(viewModel.messages.last?.role, "user")
+        XCTAssertNil(viewModel.streamingAssistantMessageID)
 
-        // Edit: streaming tokens mutate the assistant message content in place.
+        // First default emit+flush is structural (assistant append + first content).
         streamClient.emit(.token("first chunk "))
         viewModel.flushPendingStreamingContent()
         XCTAssertTrue(viewModel.messages.last?.content?.contains("first chunk") == true)
         assertMemoMatchesPureMapping("memo should match after a streaming content edit")
+        XCTAssertEqual(viewModel.messages.count, 2)
+        XCTAssertEqual(viewModel.messages.last?.role, "assistant")
+        let renderIDs = viewModel.displayedTranscriptMessages.map(\.renderID)
+        XCTAssertEqual(Set(renderIDs).count, renderIDs.count)
 
-        // Further edit: a second flush updates the same message again.
+        let before = mappingRows()
+
+        // Further edit: a later content-only flush patches one identity-stable row.
         streamClient.emit(.token("second chunk "))
         viewModel.flushPendingStreamingContent()
+        XCTAssertEqual(mappingRows() - before, 1)
         assertMemoMatchesPureMapping("memo should match after a second content edit")
+        XCTAssertEqual(viewModel.displayedTranscriptMessages.map(\.renderID), renderIDs)
+        XCTAssertEqual(Set(renderIDs).count, renderIDs.count)
+        XCTAssertTrue(viewModel.messages.last?.content?.contains("first chunk") == true)
+        XCTAssertTrue(viewModel.messages.last?.content?.contains("second chunk") == true)
+    }
+
+    @MainActor
+    func testDisplayedTranscriptMessagesFullRemapsWhenMessageCountChanges() async throws {
+        let streamClient = SpySSEStreamingClient()
+        streamClient.automaticallyFlushPendingStreamingContent = false
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/start")
+            return apiTestJSONResponse("""
+            {
+              "session_id": "session-abc",
+              "stream_id": "stream-123"
+            }
+            """, for: request)
+        }
+
+        ChatPerformanceInstrumentation.shared.reset()
+        let didStart = await viewModel.sendMessage("Stream a long response")
+        XCTAssertTrue(didStart)
+        XCTAssertEqual(viewModel.messages.count, 1)
+        XCTAssertEqual(viewModel.messages.last?.role, "user")
+        XCTAssertNil(viewModel.streamingAssistantMessageID)
+        XCTAssertEqual(mappingRows(), 1)
+        ChatPerformanceInstrumentation.shared.reset()
+        streamClient.emit(.token("x"))
+        XCTAssertEqual(viewModel.messages.count, 2)
+        XCTAssertEqual(viewModel.messages.last?.role, "assistant")
+        XCTAssertEqual(mappingRows(), 2)
+        XCTAssertEqual(
+            viewModel.displayedTranscriptMessages,
+            ChatViewModel.transcriptMessages(
+                from: viewModel.messages,
+                messageOffset: viewModel.messagesOffset
+            )
+        )
     }
 
     @MainActor
@@ -5267,6 +5316,108 @@ final class ChatViewModelSendTests: XCTestCase {
     }
 
     @MainActor
+    func testDraftSettingsRestoreDoesNotOverwriteANewerComposerInteraction() async throws {
+        var requestCount = 0
+        let viewModel = try makeViewModel(
+            sessionSummary: makeSession(model: "gpt-5.4", modelProvider: "openai", profile: "work")
+        ) { request in
+            requestCount += 1
+            XCTFail("A fenced restore must not call \(request.url?.path ?? "nil").")
+            throw URLError(.badURL)
+        }
+        let expectedGeneration = viewModel.composerConfigurationInteractionGeneration
+        viewModel.markComposerConfigurationInteraction()
+
+        await viewModel.restoreDraftSettings(
+            ChatDraftSettings(
+                modelID: "claude-sonnet-4",
+                modelProviderID: "anthropic",
+                workspacePath: "/tmp/saved"
+            ),
+            expectedInteractionGeneration: expectedGeneration
+        )
+
+        XCTAssertEqual(viewModel.selectedModelID, "gpt-5.4")
+        XCTAssertEqual(viewModel.selectedModelProviderID, "openai")
+        XCTAssertEqual(viewModel.selectedWorkspacePath, "/tmp/workspace")
+        XCTAssertEqual(requestCount, 0)
+    }
+
+    @MainActor
+    func testDraftSettingsRestoreStopsWhenSavedProfileSwitchFails() async throws {
+        var requestPaths: [String] = []
+        let viewModel = try makeViewModel(
+            sessionSummary: makeSession(model: "gpt-5.4", modelProvider: "openai", profile: "work")
+        ) { request in
+            let path = request.url?.path ?? ""
+            requestPaths.append(path)
+            switch path {
+            case "/api/profiles":
+                return apiTestJSONResponse("""
+                {
+                  "active": "work",
+                  "profiles": [
+                    {"name": "work", "model": "gpt-5.4", "provider": "openai", "is_active": true},
+                    {"name": "saved", "model": "claude-sonnet-4", "provider": "anthropic"}
+                  ]
+                }
+                """, for: request)
+            case "/api/models":
+                return apiTestJSONResponse("""
+                {
+                  "groups": [
+                    {
+                      "name": "Anthropic",
+                      "provider_id": "anthropic",
+                      "models": [{"id": "claude-sonnet-4", "name": "Claude Sonnet 4"}]
+                    }
+                  ]
+                }
+                """, for: request)
+            case "/api/reasoning":
+                return apiTestJSONResponse(#"{"reasoning_effort":"medium","supported_efforts":["medium","high"]}"#, for: request)
+            case "/api/workspaces":
+                return apiTestJSONResponse(#"{"workspaces":[{"path":"/tmp/workspace"},{"path":"/tmp/saved"}]}"#, for: request)
+            case "/api/commands":
+                return apiTestJSONResponse(#"{"commands":[]}"#, for: request)
+            case "/api/profile/switch":
+                let response = HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 500,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                return (response, Data(#"{"error":"profile unavailable"}"#.utf8))
+            case "/api/session/update":
+                XCTFail("Dependent model or workspace settings must not apply after profile failure.")
+                throw URLError(.badURL)
+            default:
+                XCTFail("Unexpected request path: \(path)")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.loadComposerConfiguration()
+        let expectedGeneration = viewModel.composerConfigurationInteractionGeneration
+        await viewModel.restoreDraftSettings(
+            ChatDraftSettings(
+                modelID: "claude-sonnet-4",
+                modelProviderID: "anthropic",
+                reasoningEffort: "high",
+                profileName: "saved",
+                workspacePath: "/tmp/saved"
+            ),
+            expectedInteractionGeneration: expectedGeneration
+        )
+
+        XCTAssertEqual(viewModel.selectedProfileName, "work")
+        XCTAssertEqual(viewModel.selectedModelID, "gpt-5.4")
+        XCTAssertEqual(viewModel.selectedWorkspacePath, "/tmp/workspace")
+        XCTAssertEqual(requestPaths.last, "/api/profile/switch")
+        XCTAssertFalse(requestPaths.contains("/api/session/update"))
+    }
+
+    @MainActor
     func testSelectingComposerModelUpdatesOnlyTheSessionAndCarriesProviderOnSend() async throws {
         let openRouterModel = "deepseek/deepseek-chat-v3-0324:free"
         let streamClient = SpySSEStreamingClient()
@@ -7517,6 +7668,59 @@ final class ChatViewModelSendTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testSuccessfulQueuedSendDeletesItsDurableDraftCopy() async throws {
+        let streamClient = SpySSEStreamingClient()
+        let attachmentStore = RecordingSendDraftAttachmentStore()
+        var chatStartCount = 0
+        let viewModel = try makeViewModel(
+            streamClient: streamClient,
+            draftAttachmentStore: attachmentStore
+        ) { request in
+            switch request.url?.path {
+            case "/api/upload":
+                return apiTestJSONResponse("""
+                {
+                  "filename": "notes.txt",
+                  "path": "/tmp/workspace/notes.txt",
+                  "size": 5,
+                  "mime": "text/plain",
+                  "is_image": false
+                }
+                """, for: request)
+            case "/api/chat/start":
+                chatStartCount += 1
+                return apiTestJSONResponse(
+                    """
+                    {"session_id":"session-abc","stream_id":"stream-\(chatStartCount)"}
+                    """,
+                    for: request
+                )
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStartFirstMessage = await viewModel.sendMessage("first message")
+        XCTAssertTrue(didStartFirstMessage)
+        await viewModel.uploadAttachment(data: Data("notes".utf8), filename: "notes.txt")
+        let queueCommand = try XCTUnwrap(SlashCommandCatalog.command(named: "queue"))
+        let queued = await viewModel.executeSlashCommand(queueCommand, args: "queued message")
+        XCTAssertEqual(queued, .executed(message: "Queued for next turn (#1)."))
+
+        streamClient.emit(.streamEnd)
+        try await waitUntil { chatStartCount == 2 }
+        let deletedNames = await attachmentStore.deletedNames()
+
+        XCTAssertEqual(deletedNames, ["saved-1-notes.txt"])
+    }
+
+    @MainActor
+    private func mappingRows() -> Int {
+        ChatPerformanceInstrumentation.shared.summary.counters[ChatPerformancePhase.transcriptMappingRows.rawValue] ?? 0
+    }
+
     /// Lets a `Task { @MainActor … }` enqueued by a delegate callback run to completion
     /// before assertions. Same-actor tasks run FIFO, so awaiting a task enqueued *after*
     /// the callback's drains it; the leading yields add slack.
@@ -7558,6 +7762,7 @@ final class ChatViewModelSendTests: XCTestCase {
         listenAudioSession: (any ListenAudioSessionControlling)? = nil,
         listenRemoteControlCenter: (any ListenRemoteControlControlling)? = nil,
         serverTTSAudioPlayerFactory: (@MainActor (Data) throws -> any ListenAudioPlaying)? = nil,
+        draftAttachmentStore: any ChatDraftAttachmentStoring = RecordingSendDraftAttachmentStore(),
         userDefaults: UserDefaults = .standard,
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
     ) throws -> ChatViewModel {
@@ -7591,6 +7796,7 @@ final class ChatViewModelSendTests: XCTestCase {
             listenAudioSession: listenAudioSession ?? SpyListenAudioSession(),
             listenRemoteControlCenter: listenRemoteControlCenter ?? SpyListenRemoteControlCenter(),
             serverTTSAudioPlayerFactory: serverTTSAudioPlayerFactory,
+            draftAttachmentStore: draftAttachmentStore,
             userDefaults: userDefaults
         )
 
@@ -7822,6 +8028,31 @@ private final class SpySpeechSynthesizer: ChatSpeechSynthesizing {
     /// delegate ignores the synthesizer argument, so a throwaway instance is fine.
     func fireDidCancel(_ utterance: AVSpeechUtterance) {
         delegate?.speechSynthesizer?(AVSpeechSynthesizer(), didCancel: utterance)
+    }
+}
+
+private actor RecordingSendDraftAttachmentStore: ChatDraftAttachmentStoring {
+    private var nextFileNumber = 1
+    private var deletedFileNames: [String] = []
+
+    func save(data: Data, suggestedFilename: String) async throws -> String {
+        let fileName = "saved-\(nextFileNumber)-\(URL(fileURLWithPath: suggestedFilename).lastPathComponent)"
+        nextFileNumber += 1
+        return fileName
+    }
+
+    func data(named fileName: String) async throws -> Data {
+        Data()
+    }
+
+    func delete(named fileName: String) async {
+        deletedFileNames.append(fileName)
+    }
+
+    func sweep(keepingReferenced fileNames: Set<String>, olderThan maxAge: TimeInterval) async {}
+
+    func deletedNames() -> [String] {
+        deletedFileNames
     }
 }
 
