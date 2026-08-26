@@ -507,6 +507,7 @@ final class ChatViewModel {
     private var latestServerLoadHadAssistantResponseAfterLatestUser = false
     private var needsComposerConfigurationReload = false
     private var pendingExplicitModelPick = false
+    private(set) var composerConfigurationInteractionGeneration = 0
 
     init(
         session: SessionSummary,
@@ -526,6 +527,7 @@ final class ChatViewModel {
         listenAudioSession: (any ListenAudioSessionControlling)? = nil,
         listenRemoteControlCenter: (any ListenRemoteControlControlling)? = nil,
         serverTTSAudioPlayerFactory: (@MainActor (Data) throws -> any ListenAudioPlaying)? = nil,
+        draftAttachmentStore: any ChatDraftAttachmentStoring = ChatDraftAttachmentStore.shared,
         userDefaults: UserDefaults = .standard
     ) {
         sessionID = session.sessionId
@@ -551,7 +553,10 @@ final class ChatViewModel {
             clarifyStreamClient: clarifyStreamClient ?? SSEClient(),
             pollingIntervals: pollingIntervals
         )
-        self.attachmentCoordinator = ChatAttachmentCoordinator(client: resolvedClient)
+        self.attachmentCoordinator = ChatAttachmentCoordinator(
+            client: resolvedClient,
+            draftAttachmentStore: draftAttachmentStore
+        )
         self.btwStreamClient = btwStreamClient ?? SSEClient()
         self.liveActivityManager = resolvedLiveActivityManager
         self.showsLiveActivityResponseExcerpts = showsLiveActivityResponseExcerpts
@@ -872,7 +877,13 @@ final class ChatViewModel {
     }
 
     @discardableResult
-    func selectComposerModel(_ option: ModelCatalogOption) async -> Bool {
+    func selectComposerModel(
+        _ option: ModelCatalogOption,
+        recordsInteraction: Bool = true
+    ) async -> Bool {
+        if recordsInteraction {
+            composerConfigurationInteractionGeneration &+= 1
+        }
         guard !option.matchesSelection(modelID: currentModel, providerID: currentModelProvider) else {
             return false
         }
@@ -1023,7 +1034,13 @@ final class ChatViewModel {
     }
 
     @discardableResult
-    func selectWorkspacePath(_ path: String) async -> Bool {
+    func selectWorkspacePath(
+        _ path: String,
+        recordsInteraction: Bool = true
+    ) async -> Bool {
+        if recordsInteraction {
+            composerConfigurationInteractionGeneration &+= 1
+        }
         let workspace = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !workspace.isEmpty else { return false }
 
@@ -1073,7 +1090,14 @@ final class ChatViewModel {
         }
     }
 
-    func switchProfile(_ profile: ProfileSummary, startNewSession: Bool) async -> ProfileSwitchOutcome? {
+    func switchProfile(
+        _ profile: ProfileSummary,
+        startNewSession: Bool,
+        recordsInteraction: Bool = true
+    ) async -> ProfileSwitchOutcome? {
+        if recordsInteraction {
+            composerConfigurationInteractionGeneration &+= 1
+        }
         guard !isViewingCachedData else {
             composerConfigurationErrorMessage = String(localized: "Reconnect to the server to change profiles.")
             return nil
@@ -1141,7 +1165,13 @@ final class ChatViewModel {
     }
 
     @discardableResult
-    func selectReasoningEffort(_ effort: String) async -> Bool {
+    func selectReasoningEffort(
+        _ effort: String,
+        recordsInteraction: Bool = true
+    ) async -> Bool {
+        if recordsInteraction {
+            composerConfigurationInteractionGeneration &+= 1
+        }
         let selectedEffort = effort.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !selectedEffort.isEmpty else { return false }
 
@@ -1175,8 +1205,89 @@ final class ChatViewModel {
         }
     }
 
-    func uploadAttachment(data: Data, filename: String, previewData: Data? = nil) async {
-        await attachmentCoordinator.uploadAttachment(data: data, filename: filename, previewData: previewData)
+    /// Restores one new-chat settings snapshot only while the configuration
+    /// remains untouched. Profile owns the defaults for the remaining fields,
+    /// so a missing or rejected profile stops the whole replay rather than
+    /// projecting its model/workspace/reasoning choices onto another profile.
+    func restoreDraftSettings(
+        _ rawSettings: ChatDraftSettings,
+        expectedInteractionGeneration: Int
+    ) async {
+        guard canContinueDraftSettingsRestore(expectedInteractionGeneration) else { return }
+        guard messages.isEmpty, activeStreamID == nil else { return }
+        let settings = rawSettings.normalized()
+
+        if let profileName = settings.profileName {
+            guard let option = profileOptions.first(where: { $0.normalizedName == profileName }) else {
+                return
+            }
+            if !isSelectedProfile(option) {
+                let outcome = await switchProfile(
+                    option,
+                    startNewSession: false,
+                    recordsInteraction: false
+                )
+                guard outcome != nil,
+                      canContinueDraftSettingsRestore(expectedInteractionGeneration),
+                      isSelectedProfile(option) else {
+                    return
+                }
+            }
+        }
+
+        guard canContinueDraftSettingsRestore(expectedInteractionGeneration) else { return }
+        if let modelID = settings.modelID,
+           let option = modelCatalogGroups
+               .flatMap(\.slashAutocompleteModels)
+               .firstMatchingSelection(modelID: modelID, providerID: settings.modelProviderID),
+           !option.matchesSelection(modelID: currentModel, providerID: currentModelProvider) {
+            _ = await selectComposerModel(option, recordsInteraction: false)
+            guard canContinueDraftSettingsRestore(expectedInteractionGeneration) else { return }
+        }
+
+        if let workspace = settings.workspacePath,
+           workspace != currentWorkspace,
+           workspaceRoots.contains(where: { $0.path == workspace }) {
+            _ = await selectWorkspacePath(workspace, recordsInteraction: false)
+            guard canContinueDraftSettingsRestore(expectedInteractionGeneration) else { return }
+        }
+
+        if let effort = settings.reasoningEffort,
+           effort != selectedReasoningEffort,
+           showsReasoningEffortControl {
+            let supportedEfforts = supportedReasoningEfforts
+            if supportedEfforts == nil || supportedEfforts?.contains(effort.lowercased()) == true {
+                _ = await selectReasoningEffort(effort, recordsInteraction: false)
+            }
+        }
+    }
+
+    func markComposerConfigurationInteraction() {
+        composerConfigurationInteractionGeneration &+= 1
+    }
+
+    private func canContinueDraftSettingsRestore(_ expectedInteractionGeneration: Int) -> Bool {
+        !Task.isCancelled
+            && composerConfigurationInteractionGeneration == expectedInteractionGeneration
+    }
+
+    /// Saves and uploads a freshly staged file into the pending strip. Returns
+    /// nil unless both the durable draft copy and server upload succeed.
+    @discardableResult
+    func uploadAttachment(data: Data, filename: String, previewData: Data? = nil) async -> PendingAttachment? {
+        await attachmentCoordinator.uploadAttachment(
+            data: data,
+            filename: filename,
+            previewData: previewData
+        )
+    }
+
+    /// Re-uploads a restored draft attachment from its durable local copy,
+    /// preserving the draft record's identity. Quiet on failure (returns nil):
+    /// the caller reports in aggregate and keeps the record for a later retry.
+    @discardableResult
+    func reuploadDraftAttachment(_ draftAttachment: ChatDraftAttachment, data: Data) async -> PendingAttachment? {
+        await attachmentCoordinator.reuploadDraftAttachment(data: data, draftAttachment: draftAttachment)
     }
 
     func clearPendingAttachments() {
@@ -2087,7 +2198,7 @@ final class ChatViewModel {
         let localMessageID = "local-\(UUID().uuidString)"
         let attachmentPreparation = attachmentCoordinator.prepareForSend(localMessageID: localMessageID)
 
-        return await performChatSend(
+        let didStart = await performChatSend(
             sessionID: sessionID,
             localMessageID: localMessageID,
             displayContent: message,
@@ -2097,6 +2208,13 @@ final class ChatViewModel {
             attachmentsToRestoreOnFailure: attachmentPreparation.attachments,
             modelContext: modelContext
         )
+        if didStart {
+            for attachment in attachmentPreparation.attachments {
+                guard let fileName = attachment.draftFileName else { continue }
+                await attachmentCoordinator.deleteDraftCopy(named: fileName)
+            }
+        }
+        return didStart
     }
 
     /// Records → transcribes → uploads → sends a server-transcribed voice note
