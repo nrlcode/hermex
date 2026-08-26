@@ -48,6 +48,14 @@ final class ChatPerformanceHostedMeasurementTests: APIClientTestCase {
         XCTAssertEqual(view.messages.count, 50)
         XCTAssertEqual(view.messages.last?.role, "assistant")
         XCTAssertEqual(view.messages.last?.content?.utf8.count, 4096)
+
+        let expectedTranscript = viewModel.displayedTranscriptMessages
+        let renderIDs = view.displayedTranscriptMessages.map(\.renderID)
+        let anchorIDs = view.displayedTranscriptMessages.map(\.anchorID)
+        XCTAssertEqual(renderIDs, expectedTranscript.map(\.renderID))
+        XCTAssertEqual(anchorIDs, expectedTranscript.map(\.anchorID))
+        XCTAssertEqual(Set(renderIDs).count, renderIDs.count)
+        XCTAssertEqual(Set(anchorIDs).count, anchorIDs.count)
     }
 
     @MainActor

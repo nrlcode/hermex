@@ -208,9 +208,9 @@ struct ChatTranscriptView: View {
         viewportWidth: CGFloat,
         contentWidth: CGFloat
     ) -> some View {
-        // Deliberate: count each eager VStack body evaluation.
+        // Deliberate: count each transcript content-body evaluation.
         ChatPerformanceInstrumentation.shared.record(.transcriptContentEvaluations)
-        return VStack(spacing: transcriptMessageSpacing) {
+        return LazyVStack(spacing: transcriptMessageSpacing) {
             olderMessagesButton(proxy: proxy)
 
             if let compressionReferenceCard, compressionReferenceCard.afterRenderID == nil {

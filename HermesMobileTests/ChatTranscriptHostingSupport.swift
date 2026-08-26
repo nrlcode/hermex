@@ -79,7 +79,7 @@ enum ChatTranscriptHostingSupport {
                 return message.role == "user" && message.attachments?.isEmpty == false
             },
             onLoadMessages: {},
-            onLoadOlderMessages: { false },
+            onLoadOlderMessages: { await viewModel.loadOlderMessages() },
             onUpdateScrollMetrics: { _ in },
             onDismissKeyboard: {},
             onScrollToBottom: { proxy in
