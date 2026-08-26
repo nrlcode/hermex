@@ -7716,6 +7716,7 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(deletedNames, ["saved-1-notes.txt"])
     }
 
+    @MainActor
     private func mappingRows() -> Int {
         ChatPerformanceInstrumentation.shared.summary.counters[ChatPerformancePhase.transcriptMappingRows.rawValue] ?? 0
     }
