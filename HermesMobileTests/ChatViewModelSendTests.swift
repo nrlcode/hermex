@@ -7666,6 +7666,7 @@ final class ChatViewModelSendTests: XCTestCase {
 
         XCTAssertEqual(deletedNames, ["saved-1-notes.txt"])
     }
+
     /// Lets a `Task { @MainActor … }` enqueued by a delegate callback run to completion
     /// before assertions. Same-actor tasks run FIFO, so awaiting a task enqueued *after*
     /// the callback's drains it; the leading yields add slack.
