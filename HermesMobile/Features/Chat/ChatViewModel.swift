@@ -272,7 +272,6 @@ final class ChatViewModel {
     }
 
     private func recomputeDisplayedTranscriptMessages() {
-        ChatPerformanceInstrumentation.shared.record(.transcriptMappingRows, units: messages.count)
         displayedTranscriptMessages = Self.transcriptMessages(
             from: messages,
             messageOffset: messagesOffset
@@ -654,14 +653,12 @@ final class ChatViewModel {
     /// Completion paths (done/cancel/error/interim/snapshot) bypass pacing via
     /// `flushPendingStreamingContent()`, which cancels any scheduled tick.
     private func drainStreamingContentTick() {
-        ChatPerformanceInstrumentation.shared.record(.drainTicks)
         var didMutate = false
         let quota = StreamingWordDrain.drainQuota(
             backlogUnitCount: StreamingWordDrain.unitCount(in: pendingAssistantTokenChunks.joined()),
             cadenceNanoseconds: streamingWordRevealCadenceNanoseconds,
             maxLagNanoseconds: streamingMaxRevealLagNanoseconds
         )
-        ChatPerformanceInstrumentation.shared.record(.drainedUnits, units: quota)
         if flushAssistantTokens(maxWordUnits: quota) {
             didMutate = true
         }
@@ -696,7 +693,6 @@ final class ChatViewModel {
     }
 
     func flushPendingStreamingContent() {
-        ChatPerformanceInstrumentation.shared.record(.finalFlushes)
         cancelPendingStreamingContentFlush()
 
         var didMutate = false
@@ -1268,18 +1264,13 @@ final class ChatViewModel {
         }
 
         resetPendingStreamingContentBuffers()
-        ChatPerformanceInstrumentation.shared.record(.messagePageLoads)
-        ChatPerformanceInstrumentation.shared.begin(.messageLoadIntervals)
         latestServerLoadHadAssistantResponseAfterLatestUser = false
         let streamLoadPreparation = streamCoordinator.prepareForSessionLoad()
         isLoading = true
         errorMessage = nil
         cacheErrorMessage = nil
         lastError = nil
-        defer {
-            isLoading = false
-            ChatPerformanceInstrumentation.shared.end(.messageLoadIntervals)
-        }
+        defer { isLoading = false }
 
         // Cache-first render (#289): capture the pre-reload window *before* painting
         // any cached transcript, so the network reconcile below replaces it cleanly
@@ -1313,7 +1304,6 @@ final class ChatViewModel {
             )
             let session = response.session
             let loadedMessages = session?.messages ?? []
-            ChatPerformanceInstrumentation.shared.record(.messagePageRows, units: loadedMessages.count)
             let loadedActiveStreamID = session?.activeStreamId?.trimmingCharacters(in: .whitespacesAndNewlines)
             let reloadedMessages: [ChatMessage]
             if let modelContext {
@@ -1547,17 +1537,12 @@ final class ChatViewModel {
         }
 
         resetPendingStreamingContentBuffers()
-        ChatPerformanceInstrumentation.shared.record(.messagePageLoads)
-        ChatPerformanceInstrumentation.shared.begin(.messageLoadIntervals)
         let messageBefore = messagesOffset
         isLoadingOlderMessages = true
         errorMessage = nil
         cacheErrorMessage = nil
         lastError = nil
-        defer {
-            isLoadingOlderMessages = false
-            ChatPerformanceInstrumentation.shared.end(.messageLoadIntervals)
-        }
+        defer { isLoadingOlderMessages = false }
 
         do {
             let response = try await client.session(
@@ -1572,7 +1557,6 @@ final class ChatViewModel {
             }
 
             let olderMessages = session.messages ?? []
-            ChatPerformanceInstrumentation.shared.record(.messagePageRows, units: olderMessages.count)
             let mergedMessages = Self.prependingOlderMessages(olderMessages, to: messages)
             let didAddMessages = mergedMessages.count > messages.count
             applyCompressionAnchorMetadata(from: session)

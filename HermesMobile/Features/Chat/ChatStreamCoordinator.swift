@@ -169,7 +169,6 @@ final class ChatStreamCoordinator {
     func cancelActiveStream() async throws -> ChatCancelResponse? {
         guard let activeStreamID else { return nil }
 
-        ChatPerformanceInstrumentation.shared.record(.cancellations)
         let response = try await client.cancelChat(streamID: activeStreamID)
         guard self.activeStreamID == activeStreamID else { return response }
         guard response.ok != false else { return response }
@@ -183,7 +182,6 @@ final class ChatStreamCoordinator {
         guard activeStreamID != nil, !hasCompletedCurrentResponse, !isConnectionSuspended else { return }
 
         lastEventID = streamClient.lastEventID ?? lastEventID
-        ChatPerformanceInstrumentation.shared.end(.streamIntervals)
         delegate?.streamCoordinatorSaveSnapshotIfNeeded()
         liveActivityManager.markStale()
         isConnectionSuspended = true
@@ -403,7 +401,6 @@ final class ChatStreamCoordinator {
     }
 
     func markProgress(now: Date = Date()) {
-        ChatPerformanceInstrumentation.shared.record(.progressRecoveryWrites)
         lastProgressDate = now
         lastTransportActivityDate = now
         lastRecoveryStatusCheckDate = nil
@@ -439,7 +436,6 @@ final class ChatStreamCoordinator {
     }
 
     private func handle(_ event: SSEEvent) {
-        ChatPerformanceInstrumentation.shared.record(.eventHandling)
         lastEventID = streamClient.lastEventID ?? lastEventID
         lastTransportActivityDate = Date()
 
@@ -461,19 +457,16 @@ final class ChatStreamCoordinator {
                 markProgress()
             }
         case .reasoning(let text):
-            ChatPerformanceInstrumentation.shared.record(.reasoningGroups)
             liveActivityManager.update(.reasoning(text))
             if delegate?.streamCoordinatorAppendReasoning(text) == true {
                 markProgress()
             }
         case .toolStarted(let payload):
-            ChatPerformanceInstrumentation.shared.record(.toolStarts)
             liveActivityManager.update(.toolStarted(name: payload.name))
             if delegate?.streamCoordinatorAppendToolCall(payload) == true {
                 markProgress()
             }
         case .toolCompleted(let payload):
-            ChatPerformanceInstrumentation.shared.record(.toolCompletions)
             liveActivityManager.update(.toolCompleted)
             if delegate?.streamCoordinatorCompleteToolCall(payload) == true {
                 markProgress()
@@ -483,7 +476,6 @@ final class ChatStreamCoordinator {
                 markProgress()
             }
         case .metering(let payload):
-            ChatPerformanceInstrumentation.shared.record(.metering)
             guard payload.sessionId == nil || payload.sessionId == delegate?.streamCoordinatorSessionID else {
                 break
             }
@@ -493,7 +485,6 @@ final class ChatStreamCoordinator {
                 liveTokensPerSecond = next
             }
         case .done(let payload):
-            ChatPerformanceInstrumentation.shared.record(.done)
             let hasCompletedTranscript = delegate?.streamCoordinatorApplyDone(payload) == true
             completeCurrentResponse(needsTranscriptRefresh: !hasCompletedTranscript)
         case .approvalPending(let update):
@@ -514,18 +505,15 @@ final class ChatStreamCoordinator {
             }
             finishStream()
         case .cancelled:
-            ChatPerformanceInstrumentation.shared.record(.cancellations)
             liveActivityManager.end(status: .cancelled, activity: String(localized: "Response cancelled"), errorSummary: nil)
             finishStream()
         case .error(let message):
-            ChatPerformanceInstrumentation.shared.record(.errors)
             if !hasCompletedCurrentResponse {
                 delegate?.streamCoordinatorDidReceiveErrorMessage(message)
             }
             liveActivityManager.end(status: .failed, activity: String(localized: "Response failed"), errorSummary: nil)
             finishStream()
         case .transportError(let message):
-            ChatPerformanceInstrumentation.shared.record(.errors)
             handleTransportError(message)
         case .heartbeat:
             // #227: a heartbeat proves the transport is alive without carrying
@@ -553,7 +541,6 @@ final class ChatStreamCoordinator {
         guard !isConnectionSuspended else { return }
 
         lastEventID = streamClient.lastEventID ?? lastEventID
-        ChatPerformanceInstrumentation.shared.end(.streamIntervals)
         delegate?.streamCoordinatorSaveSnapshotIfNeeded()
         liveActivityManager.markStale()
         isConnectionSuspended = true
@@ -651,8 +638,6 @@ final class ChatStreamCoordinator {
     }
 
     private func completeCurrentResponse(needsTranscriptRefresh: Bool) {
-        ChatPerformanceInstrumentation.shared.record(.completions)
-        ChatPerformanceInstrumentation.shared.end(.streamIntervals)
         runGeneration &+= 1
         liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
         delegate?.streamCoordinatorRemoveSnapshot(streamID: activeStreamID)
@@ -704,7 +689,6 @@ final class ChatStreamCoordinator {
     }
 
     private func finishStream() {
-        ChatPerformanceInstrumentation.shared.end(.streamIntervals)
         runGeneration &+= 1
         let completedNormally = hasCompletedCurrentResponse
         let finishedStreamID = activeStreamID
@@ -730,8 +714,6 @@ final class ChatStreamCoordinator {
         isReplay: Bool,
         recoveryState: ActiveStreamRecoveryState
     ) {
-        ChatPerformanceInstrumentation.shared.record(.streamConnections)
-        ChatPerformanceInstrumentation.shared.begin(.streamIntervals)
         let startedAt = Date()
         lastProgressDate = isReplay ? startedAt : nil
         lastTransportActivityDate = startedAt
