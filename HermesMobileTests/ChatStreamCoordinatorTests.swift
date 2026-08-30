@@ -739,6 +739,110 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
     }
 
     @MainActor
+    func testRecoveryIdleEarlyReturnsDoNotNotifyWhenStateIsUnchanged() async {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate)
+
+        let noActiveStream = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.recoveryState
+        } onChange: {
+            noActiveStream.increment()
+        }
+        await coordinator.recoverStaleStreamIfNeeded()
+        XCTAssertEqual(noActiveStream.value, 0)
+
+        coordinator.start(streamID: "stream-123")
+        delegate.streamCoordinatorHasPendingPrompt = true
+        let pendingPrompt = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.recoveryState
+        } onChange: {
+            pendingPrompt.increment()
+        }
+        await coordinator.recoverStaleStreamIfNeeded()
+        XCTAssertEqual(pendingPrompt.value, 0)
+
+        delegate.streamCoordinatorHasPendingPrompt = false
+        let progressDate = Date(timeIntervalSince1970: 1_770_000_000)
+        coordinator.markProgress(now: progressDate)
+        let freshProgress = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.recoveryState
+        } onChange: {
+            freshProgress.increment()
+        }
+        await coordinator.recoverStaleStreamIfNeeded(now: progressDate.addingTimeInterval(1))
+        XCTAssertEqual(freshProgress.value, 0)
+
+        coordinator.markProgress(now: Date().addingTimeInterval(-60))
+        streamClient.emit(.heartbeat)
+        let freshTransport = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.recoveryState
+        } onChange: {
+            freshTransport.increment()
+        }
+        await coordinator.recoverStaleStreamIfNeeded(now: Date().addingTimeInterval(1))
+        XCTAssertEqual(freshTransport.value, 0)
+    }
+
+    @MainActor
+    func testRecoveryStateNotifiesOnlyForTransitionsAndSkipsCheckingCooldownWrite() async {
+        var statusRequests = 0
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            timing: ChatStreamCoordinatorTiming(
+                checkingInterval: 5,
+                reconnectInterval: 18,
+                runningToolReconnectInterval: 25,
+                statusPollCooldown: 4,
+                transportFreshInterval: 12
+            )
+        ) { request in
+            statusRequests += 1
+            return apiTestJSONResponse(#"{"active": true, "stream_id": "stream-123"}"#, for: request)
+        }
+        let start = Date(timeIntervalSince1970: 1_770_000_000)
+        coordinator.start(streamID: "stream-123")
+        coordinator.markProgress(now: start)
+
+        let enteredChecking = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.recoveryState
+        } onChange: {
+            enteredChecking.increment()
+        }
+        await coordinator.recoverStaleStreamIfNeeded(now: start.addingTimeInterval(12.1))
+        XCTAssertEqual(enteredChecking.value, 1)
+        XCTAssertEqual(coordinator.recoveryState, .checking)
+        XCTAssertEqual(statusRequests, 1)
+
+        let cooldown = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.recoveryState
+        } onChange: {
+            cooldown.increment()
+        }
+        await coordinator.recoverStaleStreamIfNeeded(now: start.addingTimeInterval(13))
+        XCTAssertEqual(cooldown.value, 0)
+        XCTAssertEqual(coordinator.recoveryState, .checking)
+        XCTAssertEqual(statusRequests, 1)
+
+        let returnedToIdle = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.recoveryState
+        } onChange: {
+            returnedToIdle.increment()
+        }
+        coordinator.markProgress(now: start.addingTimeInterval(13))
+        XCTAssertEqual(returnedToIdle.value, 1)
+        XCTAssertEqual(coordinator.recoveryState, .idle)
+    }
+
+    @MainActor
     func testMarkProgressNotifiesWhenRecoveryLeavesChecking() async throws {
         var statusRequests = 0
         let streamClient = CoordinatorSpySSEStreamingClient()
@@ -1263,6 +1367,43 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
             sessionId: "another-session"
         )))
         XCTAssertEqual(coordinator.liveTokensPerSecond, 24.5)
+    }
+
+    @MainActor
+    func testLifecycleTokenRateClearsNotifyOnlyWhenValueChanges() {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate)
+        coordinator.start(streamID: "stream-one")
+
+        let duplicateClears = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.liveTokensPerSecond
+        } onChange: {
+            duplicateClears.increment()
+        }
+        coordinator.prepareForNewResponse()
+        coordinator.start(streamID: "stream-two")
+        _ = coordinator.prepareForSessionLoad()
+        XCTAssertEqual(duplicateClears.value, 0)
+
+        streamClient.emit(.metering(MeteringStreamEvent(
+            tokensPerSecond: 24.5,
+            isTokensPerSecondAvailable: true,
+            isEstimated: false,
+            sessionId: "session-abc"
+        )))
+        XCTAssertEqual(coordinator.liveTokensPerSecond, 24.5)
+
+        let meaningfulClear = ObservationChangeProbe()
+        withObservationTracking {
+            _ = coordinator.liveTokensPerSecond
+        } onChange: {
+            meaningfulClear.increment()
+        }
+        coordinator.prepareForNewResponse()
+        XCTAssertEqual(meaningfulClear.value, 1)
+        XCTAssertNil(coordinator.liveTokensPerSecond)
     }
 
     @MainActor
