@@ -590,7 +590,7 @@ final class ChatViewModel {
         }
 
         let catalogName = modelCatalogGroups
-            .flatMap(\.models)
+            .flatMap(\.allModels)
             .firstMatchingSelection(modelID: currentModel, providerID: currentModelProvider)?
             .displayName
 
@@ -1177,7 +1177,7 @@ final class ChatViewModel {
         guard canContinueDraftSettingsRestore(expectedInteractionGeneration) else { return }
         if let modelID = settings.modelID,
            let option = modelCatalogGroups
-               .flatMap(\.slashAutocompleteModels)
+               .flatMap(\.allModels)
                .firstMatchingSelection(modelID: modelID, providerID: settings.modelProviderID),
            !option.matchesSelection(modelID: currentModel, providerID: currentModelProvider) {
             _ = await selectComposerModel(option, recordsInteraction: false)
@@ -3321,7 +3321,7 @@ final class ChatViewModel {
 
     private func modelOption(matching query: String) -> ModelCatalogOption? {
         let normalizedQuery = query.lowercased()
-        let options = modelCatalogGroups.flatMap(\.slashAutocompleteModels)
+        let options = modelCatalogGroups.flatMap(\.allModels)
 
         if let exact = options.first(where: { $0.id.lowercased() == normalizedQuery }) {
             return exact
@@ -4285,15 +4285,21 @@ final class ChatViewModel {
     private func appendReasoning(_ text: String) -> Bool {
         guard !text.isEmpty else { return false }
 
-        // Same append-time dedup contract as appendAssistantToken: return true iff
-        // the event contributed new content, mutate only via the coalesced flush.
+        // As with assistant tokens, normal streams do not need replay matching.
+        // Avoid joining all pending reasoning text unless this is a reconnect
+        // replay where duplicate-event suppression is required.
         _ = ensureStreamingAssistantMessage()
-        let effectiveContent = liveReasoningText + pendingReasoningChunks.joined()
-        let remainder = deduplicatedReplayText(
-            text,
-            existingContent: effectiveContent,
-            matchedPrefixLength: &activeStreamReplayMatchedReasoningLength
-        )
+        let remainder: String
+        if isActiveStreamReplayConnection {
+            let effectiveContent = liveReasoningText + pendingReasoningChunks.joined()
+            remainder = deduplicatedReplayText(
+                text,
+                existingContent: effectiveContent,
+                matchedPrefixLength: &activeStreamReplayMatchedReasoningLength
+            )
+        } else {
+            remainder = text
+        }
         guard !remainder.isEmpty else { return false }
 
         pendingReasoningChunks.append(remainder)
@@ -4447,13 +4453,20 @@ final class ChatViewModel {
     private func appendAssistantToken(_ token: String) -> Bool {
         guard !token.isEmpty else { return false }
 
-        // Dedup at append time against effective content (flushed + pending) so the
-        // return value stays a synchronous progress signal for the reconnect watchdog
-        // while transcript mutation stays batched behind the coalesced flush.
-        let messageID = ensureStreamingAssistantMessage()
-        let flushedContent = messages.first(where: { $0.messageId == messageID })?.content ?? ""
-        let effectiveContent = flushedContent + pendingAssistantTokenChunks.joined()
-        let remainder = deduplicatedReplayToken(token, existingContent: effectiveContent)
+        // Normal streams cannot contain replayed content, so constructing the
+        // full flushed + pending transcript before appending every token is
+        // unnecessary. Keep the expensive effective-content comparison only on
+        // reconnect replay paths, where it protects against duplicated events.
+        let remainder: String
+        if isActiveStreamReplayConnection {
+            let messageID = ensureStreamingAssistantMessage()
+            let flushedContent = messages.first(where: { $0.messageId == messageID })?.content ?? ""
+            let effectiveContent = flushedContent + pendingAssistantTokenChunks.joined()
+            remainder = deduplicatedReplayToken(token, existingContent: effectiveContent)
+        } else {
+            _ = ensureStreamingAssistantMessage()
+            remainder = token
+        }
         guard !remainder.isEmpty else { return false }
 
         pendingAssistantTokenChunks.append(remainder)
