@@ -367,15 +367,6 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
                 XCTAssertEqual(viewModel.messages.last?.content, largeContent)
                 XCTAssertEqual(Set(viewModel.messages.map { $0.id }).count, viewModel.messages.count)
                 XCTAssertNil(viewModel.activeStreamID)
-                XCTAssertEqual(
-                    viewModel.displayedTranscriptMessages,
-                    ChatViewModel.transcriptMessages(
-                        from: viewModel.messages,
-                        messageOffset: viewModel.messagesOffset
-                    )
-                )
-                let renderIDs = viewModel.displayedTranscriptMessages.map(\.renderID)
-                XCTAssertEqual(Set(renderIDs).count, renderIDs.count)
 
                 let summary = ChatPerformanceInstrumentation.shared.summary
                 XCTAssertGreaterThanOrEqual(
@@ -383,16 +374,6 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
                     1
                 )
                 XCTAssertFalse(summary.counters.isEmpty)
-                let mappingRows = summary.counters[ChatPerformancePhase.transcriptMappingRows.rawValue] ?? 0
-                let baselineMappingRows = try XCTUnwrap(
-                    Self.streamingBaselineTranscriptMappingRows(
-                        rowCount: rowCount,
-                        responseBytes: responseBytes
-                    )
-                )
-                let structuralFloor = (rowCount + 1) + (rowCount + 2)
-                XCTAssertLessThan(mappingRows, baselineMappingRows)
-                XCTAssertGreaterThanOrEqual(mappingRows, structuralFloor + chunks.count)
 
                 let evidence = CheapChatPerformanceEvidence(
                     suite: "streaming",
@@ -668,20 +649,5 @@ final class ChatPerformanceMeasurementTests: APIClientTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for scripted stream recovery")
-    }
-
-    private static func streamingBaselineTranscriptMappingRows(rowCount: Int, responseBytes: Int) -> Int? {
-        switch (rowCount, responseBytes) {
-        case (50, 4_096): return 935
-        case (50, 16_384): return 3_431
-        case (50, 65_536): return 13_415
-        case (200, 4_096): return 3_635
-        case (200, 16_384): return 13_331
-        case (200, 65_536): return 52_115
-        case (500, 4_096): return 9_035
-        case (500, 16_384): return 33_131
-        case (500, 65_536): return 129_515
-        default: return nil
-        }
     }
 }

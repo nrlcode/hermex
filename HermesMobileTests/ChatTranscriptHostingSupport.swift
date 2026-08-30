@@ -107,13 +107,10 @@ enum ChatTranscriptHostingSupport {
         )
     }
 
-    static func host(
-        _ view: ChatTranscriptView,
-        animationsEnabled: Bool = false
-    ) -> (UIWindow, UIHostingController<ChatTranscriptView>) {
-        if !animationsEnabled {
-            UIView.setAnimationsEnabled(false)
-        }
+    static func host(_ view: ChatTranscriptView) -> (UIWindow, UIHostingController<ChatTranscriptView>) {
+        UIView.setAnimationsEnabled(false)
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
         let host = UIHostingController(rootView: view)
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
         if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
@@ -121,27 +118,16 @@ enum ChatTranscriptHostingSupport {
         }
         host.view.frame = window.bounds
         window.rootViewController = host
-        if animationsEnabled {
+        withTransaction(transaction) {
             window.makeKeyAndVisible()
-        } else {
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                window.makeKeyAndVisible()
-            }
         }
         return (window, host)
     }
 
     static func applySnapshot(
         _ view: ChatTranscriptView,
-        to host: UIHostingController<ChatTranscriptView>,
-        animationsEnabled: Bool = false
+        to host: UIHostingController<ChatTranscriptView>
     ) {
-        if animationsEnabled {
-            host.rootView = view
-            return
-        }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
