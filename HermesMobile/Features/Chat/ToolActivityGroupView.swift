@@ -5,7 +5,7 @@ struct ToolActivityGroupView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage(ChatTranscriptDisplaySettings.toolCardsStartExpandedKey) private var startsExpanded = false
-    @State private var userToggledExpansion: Bool?
+    @Binding var userToggledExpansion: Bool?
 
     private var isExpanded: Bool {
         ChatTranscriptDisplaySettings.isCardExpanded(
@@ -44,6 +44,16 @@ struct ToolActivityGroupView: View {
         )
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("transcript.tool-group.\(group.id)")
+        .background {
+            TranscriptUIKitIdentifierProbe(
+                identifier: "transcript.tool-group.\(group.id)",
+                isExpanded: isExpanded,
+                onActivate: {
+                    userToggledExpansion = !isExpanded
+                }
+            )
+        }
     }
 
     private var usesStackedHeader: Bool {
