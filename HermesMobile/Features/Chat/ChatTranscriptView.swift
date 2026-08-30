@@ -5,6 +5,7 @@ struct ChatTranscriptView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var prependScrollPositionController = ChatPrependScrollPositionController()
+    @State private var toolExpansionByGroupID: [String: Bool] = ChatTranscriptToolExpansionSeed.values
 
     let isLoading: Bool
     let errorMessage: String?
@@ -205,7 +206,7 @@ struct ChatTranscriptView: View {
         viewportWidth: CGFloat,
         contentWidth: CGFloat
     ) -> some View {
-        VStack(spacing: transcriptMessageSpacing) {
+        LazyVStack(spacing: transcriptMessageSpacing) {
             olderMessagesButton(proxy: proxy)
 
             if let compressionReferenceCard, compressionReferenceCard.afterRenderID == nil {
@@ -256,10 +257,23 @@ struct ChatTranscriptView: View {
                     onRegenerate: onRegenerate,
                     onEdit: onEdit,
                     onFork: onFork,
-                    onCopy: onCopy
+                    onCopy: onCopy,
+                    toolExpansionBinding: toolExpansionBinding(for:)
                 )
                 .equatable()
                 .id(transcriptMessage.renderID)
+                .accessibilityIdentifier(
+                    ChatPrependScrollPositionController.accessibilityIdentifier(
+                        forRenderID: transcriptMessage.renderID
+                    )
+                )
+                .background {
+                    TranscriptUIKitIdentifierProbe(
+                        identifier: ChatPrependScrollPositionController.accessibilityIdentifier(
+                            forRenderID: transcriptMessage.renderID
+                        )
+                    )
+                }
 
                 if let compressionReferenceCard,
                    compressionReferenceCard.afterRenderID == transcriptMessage.renderID {
@@ -322,22 +336,31 @@ struct ChatTranscriptView: View {
 
     private func loadOlderMessagesPreservingPosition(proxy: ScrollViewProxy) async {
         let capturedExactPosition = prependScrollPositionController.capture()
-        let renderID = displayedTranscriptMessages.first?.renderID
         let didLoad = await onLoadOlderMessages()
         guard didLoad else {
             prependScrollPositionController.cancelPreservation()
             return
         }
+        guard capturedExactPosition else { return }
 
-        if capturedExactPosition,
-           prependScrollPositionController.restoreAfterPrepend() {
+        switch prependScrollPositionController.restoreAfterPrepend() {
+        case .armed:
+            if prependScrollPositionController.needsRealizationProbe,
+               let anchorID = prependScrollPositionController.capturedAnchorRenderID {
+                prependScrollPositionController.markRealizationProbeUsed()
+                await Task.yield()
+                proxy.scrollTo(anchorID, anchor: .top)
+            }
+        case .userCancelled, .failed:
             return
         }
+    }
 
-        guard let renderID else { return }
-
-        await Task.yield()
-        proxy.scrollTo(renderID, anchor: .top)
+    private func toolExpansionBinding(for groupID: String) -> Binding<Bool?> {
+        Binding(
+            get: { toolExpansionByGroupID[groupID] },
+            set: { toolExpansionByGroupID[groupID] = $0 }
+        )
     }
 
     @ViewBuilder
@@ -357,11 +380,13 @@ struct ChatTranscriptView: View {
 
                 if !liveToolCalls.isEmpty,
                    !hasDisplayedTranscriptMessage(anchorID: toolCallAnchorMessageID) {
+                    let group = ToolCallGroup.live(
+                        anchorMessageID: toolCallAnchorMessageID,
+                        toolCalls: liveToolCalls
+                    )
                     ToolActivityGroupView(
-                        group: ToolCallGroup.live(
-                            anchorMessageID: toolCallAnchorMessageID,
-                            toolCalls: liveToolCalls
-                        )
+                        group: group,
+                        userToggledExpansion: toolExpansionBinding(for: group.id)
                     )
                 }
             }
@@ -447,7 +472,10 @@ struct ChatTranscriptView: View {
     private func toolCallGroups(anchorMessageID: String?) -> some View {
         if showsThinkingAndToolCards {
             ForEach(completedToolCallGroupsForAnchor(anchorMessageID)) { group in
-                ToolActivityGroupView(group: group)
+                ToolActivityGroupView(
+                    group: group,
+                    userToggledExpansion: toolExpansionBinding(for: group.id)
+                )
             }
         }
     }
@@ -487,6 +515,7 @@ private struct ChatTranscriptMessageBlock: View, Equatable {
     let onEdit: (MessageActionContext) -> Void
     let onFork: (MessageActionContext) -> Void
     let onCopy: (MessageActionContext) -> Void
+    let toolExpansionBinding: (String) -> Binding<Bool?>
 
     // Equality over the value inputs only. The closures are pure functions of
     // these values (e.g. `actionContext` is fully determined by
@@ -579,7 +608,10 @@ private struct ChatTranscriptMessageBlock: View, Equatable {
     private var toolActivityGroups: some View {
         if showsThinkingAndToolCards {
             ForEach(toolCallGroups) { group in
-                ToolActivityGroupView(group: group)
+                ToolActivityGroupView(
+                    group: group,
+                    userToggledExpansion: toolExpansionBinding(group.id)
+                )
             }
         }
     }
@@ -587,11 +619,13 @@ private struct ChatTranscriptMessageBlock: View, Equatable {
     @ViewBuilder
     private var liveToolActivityGroup: some View {
         if shouldRenderLiveToolActivityGroup {
+            let group = ToolCallGroup.live(
+                anchorMessageID: toolCallAnchorMessageID,
+                toolCalls: liveToolCalls
+            )
             ToolActivityGroupView(
-                group: ToolCallGroup.live(
-                    anchorMessageID: toolCallAnchorMessageID,
-                    toolCalls: liveToolCalls
-                )
+                group: group,
+                userToggledExpansion: toolExpansionBinding(group.id)
             )
         }
     }

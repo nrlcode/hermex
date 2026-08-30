@@ -83,6 +83,7 @@ struct ChatScrollObserver: UIViewRepresentable {
 
         override func layoutSubviews() {
             super.layoutSubviews()
+            coordinator?.prependScrollPositionController?.handleLayoutTick()
             coordinator?.reportMetrics(delivery: .deferred)
         }
     }
@@ -234,24 +235,90 @@ struct ChatScrollObserver: UIViewRepresentable {
     }
 }
 
+/// Hosted tests assign this before constructing `ChatTranscriptView` so
+/// `@State toolExpansionByGroupID` starts with the hoisted expansion map.
+/// Production leaves it empty.
+enum ChatTranscriptToolExpansionSeed {
+    static var values: [String: Bool] = [:]
+}
+
+/// SwiftUI `.accessibilityIdentifier` is not copied onto UIKit views for
+/// LazyVStack rows in-process. This probe is the UIView the prepend controller
+/// and hosted tests walk. Optional `onActivate` / `isExpanded` let hosted tests
+/// toggle and read tool-group expansion without relying on SwiftUI Button
+/// actions or accessibility hints, which also never land on UIKit here.
+final class TranscriptIdentifierProbeView: UIView {
+    var onActivate: (() -> Void)?
+    var isExpanded: Bool? {
+        didSet {
+            accessibilityValue = isExpanded.map { $0 ? "expanded" : "collapsed" }
+        }
+    }
+}
+
+struct TranscriptUIKitIdentifierProbe: UIViewRepresentable {
+    let identifier: String
+    var isExpanded: Bool? = nil
+    var onActivate: (() -> Void)? = nil
+
+    func makeUIView(context: Context) -> TranscriptIdentifierProbeView {
+        let view = TranscriptIdentifierProbeView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        apply(to: view)
+        return view
+    }
+
+    func updateUIView(_ uiView: TranscriptIdentifierProbeView, context: Context) {
+        apply(to: uiView)
+    }
+
+    private func apply(to view: TranscriptIdentifierProbeView) {
+        view.accessibilityIdentifier = identifier
+        view.isExpanded = isExpanded
+        view.onActivate = onActivate
+    }
+}
+
 /// Keeps the reader's exact vertical position while older transcript rows are
 /// inserted above it. `ScrollViewProxy.scrollTo(_:anchor:)` can only align a row
-/// to a coarse anchor; aligning the previous first row to `.top` loses the gap
-/// formerly occupied by the Load Older button and causes a visible hop.
+/// to a coarse anchor; aligning the previous first row to `.top` loses the
+/// intra-row offset and, under `LazyVStack`, can target an unrealized row.
 ///
-/// This controller snapshots the UIKit scroll geometry before the request, then
-/// offsets by the net content-height growth during the following layout pass.
-/// The correction is deliberately non-animated: it preserves an existing
-/// position rather than navigating to a new one.
+/// Capture records the topmost visible `transcript.row.<renderID>` and its
+/// intra-row offset. Restore locks to `clamp(rowMinY + intraRowOffsetY)` using
+/// real UIKit `contentOffset` / `contentSize` and layout ticks — not eager
+/// content-height delta and not a 1s ownership window.
 @MainActor
 final class ChatPrependScrollPositionController {
+    enum RestoreResult: Equatable {
+        case armed
+        case userCancelled
+        case failed
+    }
+
+    static let rowAccessibilityPrefix = "transcript.row."
+    /// Reversible internal: consecutive stable layout ticks that release the hard lock.
+    static let stableLayoutTickCount = 3
+
     private weak var scrollView: UIScrollView?
-    private var baselineContentHeight: CGFloat?
-    private var baselineOffsetY: CGFloat?
     private var contentSizeObservation: NSKeyValueObservation?
     private var contentOffsetObservation: NSKeyValueObservation?
-    private var completionTask: Task<Void, Never>?
     private var isApplyingCompensation = false
+    private var generation: UInt64 = 0
+    private var capturedOffsetY: CGFloat?
+    private var isHardLocked = false
+    private var isSoftWatching = false
+    private var consecutiveStableTicks = 0
+    private var lastAnchorHeight: CGFloat?
+
+    private(set) var capturedAnchorRenderID: String?
+    private(set) var capturedIntraRowOffsetY: CGFloat = 0
+    private(set) var needsRealizationProbe = false
+
+    static func accessibilityIdentifier(forRenderID renderID: String) -> String {
+        rowAccessibilityPrefix + renderID
+    }
 
     func attach(to scrollView: UIScrollView) {
         guard scrollView !== self.scrollView else { return }
@@ -268,29 +335,38 @@ final class ChatPrependScrollPositionController {
     func capture() -> Bool {
         cancelPreservation()
         guard let scrollView else { return false }
+        guard let row = topmostVisibleRow(in: scrollView) else { return false }
 
-        baselineContentHeight = scrollView.contentSize.height
-        baselineOffsetY = scrollView.contentOffset.y
+        let frameInContent = row.view.convert(row.view.bounds, to: scrollView)
+        generation += 1
+        capturedAnchorRenderID = row.renderID
+        capturedIntraRowOffsetY = scrollView.contentOffset.y - frameInContent.minY
+        capturedOffsetY = scrollView.contentOffset.y
         return true
     }
 
-    /// Arms compensation before SwiftUI performs the prepend layout. Returns
-    /// false when the user moved the scroll view while the request was in flight,
-    /// leaving the caller free to use its coarse fallback instead of overriding
-    /// user-owned movement.
+    /// Arms restore for the captured generation. User movement during the
+    /// in-flight load is `.userCancelled` and must not fall through to `scrollTo`.
     @discardableResult
-    func restoreAfterPrepend() -> Bool {
+    func restoreAfterPrepend() -> RestoreResult {
         guard let scrollView,
-              let baselineOffsetY,
-              baselineContentHeight != nil,
-              !scrollView.isDragging,
-              !scrollView.isTracking,
-              !scrollView.isDecelerating,
-              abs(scrollView.contentOffset.y - baselineOffsetY) <= 1
+              capturedAnchorRenderID != nil,
+              let capturedOffsetY
         else {
             cancelPreservation()
-            return false
+            return .failed
         }
+
+        if isUserMoving(scrollView) || abs(scrollView.contentOffset.y - capturedOffsetY) > 1 {
+            cancelPreservation()
+            return .userCancelled
+        }
+
+        needsRealizationProbe = findRow(renderID: capturedAnchorRenderID, in: scrollView) == nil
+        isHardLocked = true
+        isSoftWatching = true
+        consecutiveStableTicks = 0
+        lastAnchorHeight = nil
 
         contentSizeObservation = scrollView.observe(\.contentSize, options: [.new]) { [weak self] _, _ in
             Self.handleObservedContentSizeChange(for: self)
@@ -299,26 +375,44 @@ final class ChatPrependScrollPositionController {
             Self.handleObservedUserMovement(for: self, scrollView: scrollView)
         }
 
-        // Text and attachment layout can settle over several run-loop passes.
-        // Keep applying the same net-height correction for a short bounded
-        // window, then release ownership back to normal scrolling.
-        completionTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled, let self else { return }
-            self.applyCompensation()
-            self.cancelPreservation()
-        }
-        return true
+        applyRestore(fromLayoutTick: false)
+        return .armed
     }
 
     func cancelPreservation() {
         contentSizeObservation = nil
         contentOffsetObservation = nil
-        completionTask?.cancel()
-        completionTask = nil
-        baselineContentHeight = nil
-        baselineOffsetY = nil
+        capturedAnchorRenderID = nil
+        capturedIntraRowOffsetY = 0
+        capturedOffsetY = nil
+        needsRealizationProbe = false
+        isHardLocked = false
+        isSoftWatching = false
+        consecutiveStableTicks = 0
+        lastAnchorHeight = nil
         isApplyingCompensation = false
+    }
+
+    func handleLayoutTick() {
+        applyRestore(fromLayoutTick: true)
+    }
+
+    func markRealizationProbeUsed() {
+        needsRealizationProbe = false
+    }
+
+    nonisolated static func clampedOffsetY(
+        targetY: CGFloat,
+        adjustedInset: UIEdgeInsets,
+        contentSizeHeight: CGFloat,
+        boundsHeight: CGFloat
+    ) -> CGFloat {
+        let minimumY = -adjustedInset.top
+        let maximumY = max(
+            minimumY,
+            contentSizeHeight - boundsHeight + adjustedInset.bottom
+        )
+        return min(max(targetY, minimumY), maximumY)
     }
 
     nonisolated private static func handleObservedContentSizeChange(
@@ -327,14 +421,14 @@ final class ChatPrependScrollPositionController {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak controller] in
                 MainActor.assumeIsolated {
-                    controller?.applyCompensation()
+                    controller?.applyRestore(fromLayoutTick: false)
                 }
             }
             return
         }
 
         MainActor.assumeIsolated {
-            controller?.applyCompensation()
+            controller?.applyRestore(fromLayoutTick: false)
         }
     }
 
@@ -358,48 +452,95 @@ final class ChatPrependScrollPositionController {
     }
 
     private func cancelIfUserIsMoving(_ scrollView: UIScrollView) {
-        guard !isApplyingCompensation,
-              scrollView.isDragging || scrollView.isTracking || scrollView.isDecelerating
-        else { return }
-
+        guard !isApplyingCompensation, isUserMoving(scrollView) else { return }
         cancelPreservation()
     }
 
-    private func applyCompensation() {
-        guard let scrollView,
-              let baselineContentHeight,
-              let baselineOffsetY
+    private func isUserMoving(_ scrollView: UIScrollView) -> Bool {
+        scrollView.isDragging || scrollView.isTracking || scrollView.isDecelerating
+    }
+
+    private func applyRestore(fromLayoutTick: Bool) {
+        guard isHardLocked || isSoftWatching, let scrollView, generation > 0 else { return }
+        guard !isUserMoving(scrollView) else {
+            cancelPreservation()
+            return
+        }
+        guard let anchorID = capturedAnchorRenderID,
+              let row = findRow(renderID: anchorID, in: scrollView)
         else { return }
 
-        let targetY = Self.compensatedOffsetY(
-            baselineOffsetY: baselineOffsetY,
-            contentHeightDelta: scrollView.contentSize.height - baselineContentHeight,
+        needsRealizationProbe = false
+        let frameInContent = row.convert(row.bounds, to: scrollView)
+        let targetY = Self.clampedOffsetY(
+            targetY: frameInContent.minY + capturedIntraRowOffsetY,
             adjustedInset: scrollView.adjustedContentInset,
             contentSizeHeight: scrollView.contentSize.height,
             boundsHeight: scrollView.bounds.height
         )
-        guard abs(scrollView.contentOffset.y - targetY) > 0.5 else { return }
 
-        isApplyingCompensation = true
-        var offset = scrollView.contentOffset
-        offset.y = targetY
-        scrollView.setContentOffset(offset, animated: false)
-        isApplyingCompensation = false
+        if abs(scrollView.contentOffset.y - targetY) > 0.5 {
+            isApplyingCompensation = true
+            var offset = scrollView.contentOffset
+            offset.y = targetY
+            scrollView.setContentOffset(offset, animated: false)
+            isApplyingCompensation = false
+            consecutiveStableTicks = 0
+            lastAnchorHeight = frameInContent.height
+            return
+        }
+
+        guard fromLayoutTick, isHardLocked else { return }
+
+        if let lastAnchorHeight, abs(lastAnchorHeight - frameInContent.height) < 0.5 {
+            consecutiveStableTicks += 1
+        } else {
+            consecutiveStableTicks = 0
+        }
+        lastAnchorHeight = frameInContent.height
+        if consecutiveStableTicks >= Self.stableLayoutTickCount {
+            isHardLocked = false
+            isSoftWatching = true
+        }
     }
 
-    nonisolated static func compensatedOffsetY(
-        baselineOffsetY: CGFloat,
-        contentHeightDelta: CGFloat,
-        adjustedInset: UIEdgeInsets,
-        contentSizeHeight: CGFloat,
-        boundsHeight: CGFloat
-    ) -> CGFloat {
-        let minimumY = -adjustedInset.top
-        let maximumY = max(
-            minimumY,
-            contentSizeHeight - boundsHeight + adjustedInset.bottom
-        )
-        return min(max(baselineOffsetY + contentHeightDelta, minimumY), maximumY)
+    private func topmostVisibleRow(in scrollView: UIScrollView) -> (view: UIView, renderID: String)? {
+        let visibleRect = scrollView.bounds
+        var best: (view: UIView, minY: CGFloat, renderID: String)?
+        enumerateRows(in: scrollView) { view, renderID, frameInContent in
+            guard frameInContent.intersects(visibleRect) else { return }
+            if best == nil || frameInContent.minY < best!.minY {
+                best = (view, frameInContent.minY, renderID)
+            }
+        }
+        return best.map { ($0.view, $0.renderID) }
+    }
+
+    private func findRow(renderID: String?, in scrollView: UIScrollView) -> UIView? {
+        guard let renderID else { return nil }
+        var match: UIView?
+        enumerateRows(in: scrollView) { view, id, _ in
+            if match == nil, id == renderID {
+                match = view
+            }
+        }
+        return match
+    }
+
+    private func enumerateRows(
+        in root: UIView,
+        visit: (UIView, String, CGRect) -> Void
+    ) {
+        if let identifier = root.accessibilityIdentifier,
+           identifier.hasPrefix(Self.rowAccessibilityPrefix) {
+            let renderID = String(identifier.dropFirst(Self.rowAccessibilityPrefix.count))
+            if !renderID.isEmpty, let scrollView {
+                visit(root, renderID, root.convert(root.bounds, to: scrollView))
+            }
+        }
+        for subview in root.subviews {
+            enumerateRows(in: subview, visit: visit)
+        }
     }
 }
 

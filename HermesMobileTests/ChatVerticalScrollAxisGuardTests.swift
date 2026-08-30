@@ -135,54 +135,80 @@ final class ChatVerticalScrollAxisGuardTests: XCTestCase {
 
 @MainActor
 final class ChatPrependScrollPositionControllerTests: XCTestCase {
-    func testPrependCompensatesByExactContentHeightGrowth() {
-        let scrollView = makeScrollView()
-        scrollView.contentOffset = CGPoint(x: 0, y: 240)
+    func testPrependRestoresIntraRowOffsetWhenRealizedHeightLagsContentSize() {
+        let (scrollView, row) = makeAnchoredScrollView(rowMinY: 200, intraRowOffsetY: 24)
         let controller = ChatPrependScrollPositionController()
         controller.attach(to: scrollView)
 
         XCTAssertTrue(controller.capture())
-        XCTAssertTrue(controller.restoreAfterPrepend())
+        XCTAssertEqual(controller.capturedAnchorRenderID, "anchor-a")
+        XCTAssertEqual(controller.capturedIntraRowOffsetY, 24, accuracy: 0.001)
+        XCTAssertEqual(controller.restoreAfterPrepend(), .armed)
 
-        scrollView.contentSize.height += 640
+        // Lazy realization: contentSize grows only a little while the tagged
+        // row later jumps much farther. Height-delta restore would under-shift.
+        scrollView.contentSize.height += 40
+        row.frame.origin.y = 640
+        controller.handleLayoutTick()
 
-        XCTAssertEqual(scrollView.contentOffset.y, 880, accuracy: 0.001)
+        XCTAssertEqual(scrollView.contentOffset.y, 664, accuracy: 0.001)
+    }
+
+    func testPrependKeepsRestoringAfterDelayedFrameChange() {
+        let (scrollView, row) = makeAnchoredScrollView(rowMinY: 200, intraRowOffsetY: 24)
+        let controller = ChatPrependScrollPositionController()
+        controller.attach(to: scrollView)
+
+        XCTAssertTrue(controller.capture())
+        XCTAssertEqual(controller.restoreAfterPrepend(), .armed)
+
+        row.frame.origin.y = 640
+        scrollView.contentSize.height += 40
+        controller.handleLayoutTick()
+        XCTAssertEqual(scrollView.contentOffset.y, 664, accuracy: 0.001)
+
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 1.05))
+        row.frame.origin.y = 900
+        scrollView.contentSize.height = 2_000
+        controller.handleLayoutTick()
+        XCTAssertEqual(scrollView.contentOffset.y, 924, accuracy: 0.001)
     }
 
     func testCancelledPrependDoesNotMoveScrollPosition() {
-        let scrollView = makeScrollView()
-        scrollView.contentOffset = CGPoint(x: 0, y: 240)
+        let (scrollView, row) = makeAnchoredScrollView(rowMinY: 200, intraRowOffsetY: 40)
         let controller = ChatPrependScrollPositionController()
         controller.attach(to: scrollView)
 
         XCTAssertTrue(controller.capture())
         controller.cancelPreservation()
+        row.frame.origin.y = 640
         scrollView.contentSize.height += 640
+        controller.handleLayoutTick()
 
         XCTAssertEqual(scrollView.contentOffset.y, 240, accuracy: 0.001)
     }
 
     func testPrependDoesNotOverrideMovementWhileRequestIsInFlight() {
-        let scrollView = makeScrollView()
-        scrollView.contentOffset = CGPoint(x: 0, y: 240)
+        let (scrollView, row) = makeAnchoredScrollView(rowMinY: 200, intraRowOffsetY: 40)
         let controller = ChatPrependScrollPositionController()
         controller.attach(to: scrollView)
 
         XCTAssertTrue(controller.capture())
         scrollView.contentOffset.y = 300
 
-        XCTAssertFalse(controller.restoreAfterPrepend())
+        XCTAssertEqual(controller.restoreAfterPrepend(), .userCancelled)
+        row.frame.origin.y = 640
         scrollView.contentSize.height += 640
+        controller.handleLayoutTick()
         XCTAssertEqual(scrollView.contentOffset.y, 300, accuracy: 0.001)
     }
 
-    func testCompensatedOffsetClampsToScrollableBounds() {
+    func testClampedOffsetClampsToScrollableBounds() {
         let inset = UIEdgeInsets(top: 12, left: 0, bottom: 20, right: 0)
 
         XCTAssertEqual(
-            ChatPrependScrollPositionController.compensatedOffsetY(
-                baselineOffsetY: -12,
-                contentHeightDelta: -100,
+            ChatPrependScrollPositionController.clampedOffsetY(
+                targetY: -112,
                 adjustedInset: inset,
                 contentSizeHeight: 1_200,
                 boundsHeight: 480
@@ -191,9 +217,8 @@ final class ChatPrependScrollPositionControllerTests: XCTestCase {
             accuracy: 0.001
         )
         XCTAssertEqual(
-            ChatPrependScrollPositionController.compensatedOffsetY(
-                baselineOffsetY: 700,
-                contentHeightDelta: 500,
+            ChatPrependScrollPositionController.clampedOffsetY(
+                targetY: 1_200,
                 adjustedInset: inset,
                 contentSizeHeight: 1_200,
                 boundsHeight: 480
@@ -203,9 +228,20 @@ final class ChatPrependScrollPositionControllerTests: XCTestCase {
         )
     }
 
-    private func makeScrollView() -> UIScrollView {
+    private func makeAnchoredScrollView(
+        rowMinY: CGFloat,
+        intraRowOffsetY: CGFloat
+    ) -> (UIScrollView, UIView) {
         let scrollView = UIScrollView(frame: CGRect(x: 0, y: 0, width: 320, height: 480))
         scrollView.contentSize = CGSize(width: 320, height: 1_200)
-        return scrollView
+        let content = UIView(frame: CGRect(x: 0, y: 0, width: 320, height: 1_200))
+        let row = UIView(frame: CGRect(x: 0, y: rowMinY, width: 320, height: 80))
+        row.accessibilityIdentifier = ChatPrependScrollPositionController.accessibilityIdentifier(
+            forRenderID: "anchor-a"
+        )
+        content.addSubview(row)
+        scrollView.addSubview(content)
+        scrollView.contentOffset = CGPoint(x: 0, y: rowMinY + intraRowOffsetY)
+        return (scrollView, row)
     }
 }
